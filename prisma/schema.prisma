@@ -1,0 +1,67 @@
+// Prisma schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Merchants {
+  id        String   @id @default(uuid())
+  publicId  String   @unique
+  name      String
+  email     String   @unique
+  createdAt DateTime @default(now())
+
+  payments Payments[]
+}
+
+model Payments {
+  id         String   @id @default(uuid())
+  publicId   String   @unique
+  merchantId String
+  amount     BigInt
+  currency   String
+  status     PaymentStatus
+  metadata   Json?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  merchant      Merchants      @relation(fields: [merchantId], references: [id])
+  transactions  Transactions[]
+
+  @@index([merchantId])
+}
+
+model Transactions {
+  id         String   @id @default(uuid())
+  publicId   String   @unique
+  paymentId  String
+  method     String
+  status     TransactionStatus
+  gatewayRef String   @unique
+  createdAt  DateTime @default(now())
+
+  payment Payments @relation(fields: [paymentId], references: [id])
+
+  @@index([paymentId])
+}
+
+enum PaymentStatus {
+  CREATED
+  PENDING
+  SUCCESS
+  FAILED
+  CANCELLED
+}
+
+enum TransactionStatus {
+  CREATED
+  PENDING
+  SUCCESS
+  FAILED
+  EXPIRED
+}
