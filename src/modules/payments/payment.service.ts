@@ -4,6 +4,7 @@ import { CreatePaymentDto } from "./dto/create-payment.dto";
 import { generatePublicId } from "src/common/utils/generate-public-id";
 import { toPaisa, toRupees } from "src/common/utils/format.money";
 import { PaymentStatus } from "@prisma/client";
+import { logger } from "src/common/logger/logger";
 
 @Injectable()
 export class PaymentService {
@@ -19,6 +20,7 @@ export class PaymentService {
         })
 
         if (!merchant) {
+            logger.error(`Merchant not found for public ID ${dto.merchantId}`);
             throw new NotFoundException({
                 status: false,
                 message: 'Merchant not found',
@@ -32,6 +34,10 @@ export class PaymentService {
             data: {
                 publicId,
                 merchantId: merchant.id,
+                payerName: dto.payerName,
+                payerEmail: dto.payerEmail,
+                countryCode: dto.countryCode,
+                payerPhone: dto.payerPhone,
                 amount,
                 currency: dto.currency,
                 status: PaymentStatus.CREATED,
@@ -39,6 +45,7 @@ export class PaymentService {
             },
         })
 
+        logger.info(`Payment created with public ID ${publicId}`);
         return {
             status: true,
             message: 'Payment created successfully',
@@ -55,6 +62,10 @@ export class PaymentService {
             where: { publicId },
             select: {
                 publicId: true,
+                payerName: true,
+                payerEmail: true,
+                countryCode: true,
+                payerPhone: true,
                 amount: true,
                 merchant: {
                     select: {
@@ -95,10 +106,20 @@ export class PaymentService {
         }
     }
 
-    async getAllPayments() {
+    async getAllPayments(cursor?: string, limit = 2) {
         const payments = await this.prisma.payments.findMany({
+            take: limit,
+            skip: cursor ? 1 : 0,
+            cursor: cursor ? { publicId: cursor } : undefined,
+            orderBy: {
+                createdAt: 'desc',
+            },
             select: {
                 publicId: true,
+                payerName: true,
+                payerEmail: true,
+                countryCode: true,
+                payerPhone: true,
                 amount: true,
                 merchant: {
                     select: {
@@ -122,14 +143,35 @@ export class PaymentService {
         })
 
         const formatted = payments.map((p) => ({
-            ...p,
+            publicId: p.publicId,
             amount: toRupees(p.amount),
-        }))
+            payerName: p.payerName,
+            payerEmail: p.payerEmail,
+            countryCode: p.countryCode,
+            payerPhone: p.payerPhone,
+            currency: p.currency,
+            status: p.status,
+            createdAt: p.createdAt,
+            updatedAt: p.updatedAt,
+            merchant: {
+              publicId: p.merchant.publicId,
+              name: p.merchant.name,
+              email: p.merchant.email,
+            },
+            transactions: p.transactions.map((t) => ({
+              publicId: t.publicId,
+              method: t.method,
+              status: t.status,
+            })),
+          }));
+
+        const nextCursor = payments.length > 0 ? payments[payments.length - 1].publicId : null;
 
         return {
             status: true,
             message: 'Payments fetched successfully',
             data: formatted,
+            nextCursor,
         }
     }
 }

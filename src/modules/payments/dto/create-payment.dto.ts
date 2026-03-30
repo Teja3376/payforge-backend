@@ -18,4 +18,20 @@ export class CreatePaymentDto {
     @IsObject()
     metadata: Record<string, any>;
 
+    @IsOptional()
+    @IsString()
+    payerName: string;
+
+    @IsOptional()
+    @IsString()
+    payerEmail: string;
+
+    @IsOptional()
+    @IsString()
+    countryCode: string;
+
+    @IsOptional()
+    @IsString()
+    payerPhone: string;
+
 }

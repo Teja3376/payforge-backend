@@ -14,40 +14,62 @@ model Merchants {
   publicId  String   @unique
   name      String
   email     String   @unique
+  balance   BigInt   @default(0)
   createdAt DateTime @default(now())
 
   payments Payments[]
+  ledgers  Ledgers[]
 }
 
 model Payments {
-  id         String   @id @default(uuid())
-  publicId   String   @unique
+  id         String        @id @default(uuid())
+  publicId   String        @unique
   merchantId String
   amount     BigInt
   currency   String
+  payerName  String?
+  payerEmail String?
+  countryCode String?
+  payerPhone String?
   status     PaymentStatus
   metadata   Json?
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
 
-  merchant      Merchants      @relation(fields: [merchantId], references: [id])
-  transactions  Transactions[]
+  merchant     Merchants      @relation(fields: [merchantId], references: [id])
+  transactions Transactions[]
 
   @@index([merchantId])
 }
 
 model Transactions {
-  id         String   @id @default(uuid())
-  publicId   String   @unique
-  paymentId  String
-  method     String
-  status     TransactionStatus
-  gatewayRef String   @unique
-  createdAt  DateTime @default(now())
+  id             String            @id @default(uuid())
+  publicId       String            @unique
+  paymentId      String
+  method         String
+  status         TransactionStatus
+  gatewayRef     String            @unique
+  idempotencyKey String            @unique
+  amount         BigInt
+  fee            BigInt            @default(0)
+  netAmount      BigInt            @default(0)
+  createdAt      DateTime          @default(now())
 
   payment Payments @relation(fields: [paymentId], references: [id])
 
   @@index([paymentId])
+}
+
+model Ledgers {
+  id          String     @id @default(uuid())
+  publicId    String     @unique
+  merchantId  String
+  amount      BigInt
+  type        LedgerType
+  referenceId String
+  createdAt   DateTime   @default(now())
+
+  merchant Merchants @relation(fields: [merchantId], references: [id])
 }
 
 enum PaymentStatus {
@@ -64,4 +86,9 @@ enum TransactionStatus {
   SUCCESS
   FAILED
   EXPIRED
+}
+
+enum LedgerType {
+  CREDIT
+  DEBIT
 }

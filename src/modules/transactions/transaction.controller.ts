@@ -1,7 +1,8 @@
-import { Body, Controller, Get, Param, Post, Put } from "@nestjs/common";
+import { Body, Controller, Get, Param, Post, Put, Query } from "@nestjs/common";
 import { TransactionService } from "./transaction.service";
 import { CreateTransactionDto } from "./dto/create-transaction.dto";
 import { UpdateTransactionDto } from "./dto/update-transaction.dto";
+import { ApiQuery } from "@nestjs/swagger";
 
 @Controller('transaction')
 export class TransactionController {
@@ -24,7 +25,15 @@ export class TransactionController {
         return this.transactionService.getTransaction(publicId)
     }
     @Get()
-    getAllTransactions() {
-        return this.transactionService.getAllTransactions()
+    @ApiQuery({ name: 'cursor', required: false, type: String })
+    @ApiQuery({ name: 'limit', required: false, type: String })
+    getAllTransactions(
+        @Query('cursor') cursor?: string,
+        @Query('limit') limit?: string,
+    ) {
+        return this.transactionService.getAllTransactions(
+            cursor,
+            limit ? parseInt(limit) : 10
+        );
     }
 }

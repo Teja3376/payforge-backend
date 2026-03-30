@@ -8,4 +8,8 @@ export class CreateTransactionDto {
     @IsString()
     @IsNotEmpty()
     method: string;
+
+    @IsString()
+    @IsNotEmpty()
+    idempotencyKey: string;
 }
