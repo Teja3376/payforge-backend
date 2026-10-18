@@ -69,7 +69,7 @@ export class PaymentService {
     });
 
     const replayed = await this.prisma.payments.findUnique({
-      where: { userId_idempotencyKey: { userId: user.id, idempotencyKey } },
+      where: { userId_idempotencyKey: { userId: user.ownerUserId, idempotencyKey } },
       select: paymentSelect,
     });
     if (replayed) {
@@ -106,7 +106,7 @@ export class PaymentService {
       const payment = await this.prisma.payments.create({
         data: {
           publicId: generatePublicId('pf-pay'),
-          userId: user.id,
+          userId: user.ownerUserId,
           merchantId: merchant.id,
           amount: quote.chargedMinor,
           currency: dto.currency.toUpperCase(),
@@ -128,7 +128,7 @@ export class PaymentService {
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
         const raced = await this.prisma.payments.findUnique({
-          where: { userId_idempotencyKey: { userId: user.id, idempotencyKey } },
+          where: { userId_idempotencyKey: { userId: user.ownerUserId, idempotencyKey } },
           select: paymentSelect,
         });
         if (raced) {
@@ -235,7 +235,7 @@ export class PaymentService {
     if (user.role === Role.MERCHANT) {
       return { merchantId: user.merchantId ?? 'none' };
     }
-    return { userId: user.id };
+    return { userId: user.ownerUserId };
   }
 
   /**

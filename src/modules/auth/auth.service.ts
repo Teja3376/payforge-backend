@@ -211,41 +211,19 @@ async refresh(refreshToken: string) {
       }
 
       if (session.revokedAt) {
-        // This token was already rotated. Presenting it again means either a
-        // stolen token or a client that replayed one it had already spent.
-        // Revoke the whole family: the legitimate session and the attacker's
-        // are both compromised, and only a new sign-in should resolve it.
-        if (session.familyId) {
-          await tx.session.updateMany({
-            where: { userId: session.userId, familyId: session.familyId, revokedAt: null },
-            data: { revokedAt: now, revokedReason: 'REFRESH_TOKEN_REUSE' },
-          });
-        }
-        await tx.resolution.create({
-          data: {
-            publicId: generatePublicId('pf-res'),
-            actorId: null,
-            actorType: ActorType.SYSTEM,
-            action: ResolutionAction.SESSION_REVOKED_REUSE,
-            subjectType: ResolutionSubject.USER,
-            subjectPublicId: session.userId,
-            metadata: {
-              sessionId: session.id,
-              familyId: session.familyId ?? null,
-              reason: 'a rotated refresh token was replayed',
-            },
-          },
-        });
-
-        this.log.error(
-          { userId: session.userId, sessionId: session.id },
-          'replayed refresh token detected — revoked the entire session family',
-        );
-
-        throw ApiError.of(
-          ErrorCode.TOKEN_REVOKED,
-          'This session is no longer valid. Please sign in again.',
-        );
+        // Replay of an already-rotated token: a stolen token, or a client
+        // re-spending one it had already used.
+        //
+        // The revocation is deliberately NOT done here. Throwing from inside
+        // this transaction rolls it back, which silently discarded both the
+        // family revocation and the audit row — so the theft was detected,
+        // reported to the caller as handled, and then thrown away. Live
+        // testing confirmed: zero SESSION_REVOKED_REUSE rows, the sibling
+        // session still live, still minting fresh tokens indefinitely.
+        //
+        // Returning a marker lets the revocation run in its own committing
+        // transaction, after this one has rolled back.
+        return { kind: 'reuse' as const, sessionId: session.id, userId: session.userId, familyId: session.familyId };
       }
 
       // Burn the presented token and mint its successor atomically, so a
@@ -275,8 +253,57 @@ async refresh(refreshToken: string) {
         },
       });
 
-      return { userId: session.userId, sessionId: next.id, refreshToken: refresh };
+      return { kind: 'rotated' as const, userId: session.userId, sessionId: next.id, refreshToken: refresh };
     });
+
+    // Replay detected. Revoke the whole family in a transaction that COMMITS,
+    // then fail the caller. Both the legitimate session and the attacker's are
+    // compromised, and only a fresh sign-in should resolve it.
+    if (rotated.kind === 'reuse') {
+      const revokedAt = new Date();
+      // The family id is `session.familyId ?? session.id` — the same expression
+      // used when minting a successor. Without the fallback this revokes
+      // nothing at all for a replayed token that is the *root* of its family,
+      // because a family's first session has `familyId = null`. Every descendant
+      // points at that root's own id, so the root's id is the right key.
+      const familyId = rotated.familyId ?? rotated.sessionId;
+
+      await this.prisma.$transaction(async (tx) => {
+        await tx.session.updateMany({
+          where: {
+            userId: rotated.userId,
+            OR: [{ familyId }, { id: rotated.sessionId }],
+            revokedAt: null,
+          },
+          data: { revokedAt, revokedReason: 'REFRESH_TOKEN_REUSE' },
+        });
+        await tx.resolution.create({
+          data: {
+            publicId: generatePublicId('pf-res'),
+            actorId: null,
+            actorType: ActorType.SYSTEM,
+            action: ResolutionAction.SESSION_REVOKED_REUSE,
+            subjectType: ResolutionSubject.USER,
+            subjectPublicId: rotated.userId,
+            metadata: {
+              sessionId: rotated.sessionId,
+              familyId,
+              reason: 'a rotated refresh token was replayed',
+            },
+          },
+        });
+      });
+
+      this.log.error(
+        { userId: rotated.userId, sessionId: rotated.sessionId },
+        'replayed refresh token detected — revoked the entire session family',
+      );
+
+      throw ApiError.of(
+        ErrorCode.TOKEN_REVOKED,
+        'This session is no longer valid. Please sign in again.',
+      );
+    }
 
     return {
       accessToken: await this.jwt.signAsync(

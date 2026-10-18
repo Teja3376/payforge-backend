@@ -6,6 +6,7 @@ import { hashApiKey } from '../crypto/crypto';
 import { ApiError, ErrorCode } from '../errors/api-error';
 import { setRequestContext } from '../logger/logger';
 import { IS_PUBLIC_KEY } from '../decorators/public.decorator';
+import { PENDING_MERCHANT_KEY } from '../decorators/pending-merchant.decorator';
 import { PrismaService } from '../../database/prisma.service';
 
 /**
@@ -62,7 +63,7 @@ export class AuthGuard implements CanActivate {
 
     const principal = apiKeyHeader
       ? await this.authenticateApiKey(apiKeyHeader)
-      : await this.authenticateJwt(bearer);
+      : await this.authenticateJwt(bearer, context);
 
     request.user = principal;
     setRequestContext({
@@ -118,9 +119,33 @@ export class AuthGuard implements CanActivate {
       .update({ where: { id: key.id }, data: { lastUsedAt: new Date() } })
       .catch(() => undefined);
 
+    // The `Users` row that owns anything this key creates.
+    //
+    // `Payments.userId`, `Transactions.userId` and `Resolution.actorId` are all
+    // foreign keys onto `Users`. Writing `key.id` into them raised a foreign
+    // key violation, so POST /payments, /transactions, /refunds and /payouts
+    // all returned an opaque 500 for API-key callers — breaking the entire
+    // merchant-server integration path.
+    //
+    // Resolving the merchant's owner account also makes idempotency
+    // merchant-scoped: two keys on the same merchant replaying the same order
+    // key collapse onto one row rather than minting two payments.
+    const owner = await this.prisma.users.findFirst({
+      where: { merchantId: key.merchantId, deletedAt: null },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true },
+    });
+    if (!owner) {
+      throw ApiError.of(
+        ErrorCode.FORBIDDEN,
+        'This API key is not attached to a merchant account with an owner.',
+      );
+    }
+
     return {
       actorType: ActorType.API_KEY,
       id: key.id,
+      ownerUserId: owner.id,
       publicId: key.publicId,
       email: null,
       role: 'MERCHANT',
@@ -131,7 +156,10 @@ export class AuthGuard implements CanActivate {
     };
   }
 
-  private async authenticateJwt(token: string | undefined): Promise<RequestUser> {
+  private async authenticateJwt(
+    token: string | undefined,
+    context: ExecutionContext,
+  ): Promise<RequestUser> {
     if (!token) {
       throw ApiError.of(
         ErrorCode.UNAUTHENTICATED,
@@ -158,8 +186,39 @@ export class AuthGuard implements CanActivate {
       );
     }
 
-    // Honour the `sid` claim.
+    // A merchant session inherits its merchant's status.
     //
+    // `authenticateApiKey` has always checked this, but the JWT branch did not
+    // — so the onboarding gate was one header away from being decorative. Live
+    // testing found a merchant with REJECTED KYC using a session token to
+    // create a default payout destination, pre-wiring a bank account to receive
+    // funds before approval.
+    //
+    // Deliberately NOT a blanket guard: a PENDING_REVIEW merchant must still be
+    // able to read its profile and submit KYC — that is how it becomes ACTIVE.
+    // `AllowPendingMerchant` opts individual routes in, so the exemption is a
+    // declared decision rather than a side effect of route ordering.
+    const allowPending = this.reflector.getAllAndOverride<boolean>(PENDING_MERCHANT_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    if (user.merchantId && !allowPending) {
+      const merchant = await this.prisma.merchants.findUnique({
+        where: { id: user.merchantId },
+        select: { status: true },
+      });
+      if (!merchant) {
+        throw ApiError.of(ErrorCode.MERCHANT_NOT_FOUND);
+      }
+      if (merchant.status !== 'ACTIVE') {
+        throw ApiError.of(
+          ErrorCode.MERCHANT_NOT_ACTIVE,
+          'This merchant account is not active.',
+        );
+      }
+    }
+
+    // Honour the `sid` claim.
     // The claim was minted at login but never consulted, so revoking a session
     // left its access token usable for the full hour. `POST /auth/logout` is
     // documented as "Revoke the current session" and did not do that.
@@ -195,6 +254,7 @@ export class AuthGuard implements CanActivate {
     return {
       actorType: ActorType.USER,
       id: user.id,
+      ownerUserId: user.id,
       publicId: user.publicId,
       email: user.email,
       role: user.role,

@@ -42,7 +42,7 @@ export class RefundService {
       currency: payment.settlementCurrency,
       reason: input.reason,
       idempotencyKey: input.idempotencyKey,
-      actorId: input.user.id,
+      actorId: input.user.ownerUserId,
       actorType: input.user.actorType ?? ActorType.USER,
     });
   }

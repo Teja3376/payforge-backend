@@ -23,6 +23,12 @@
     "noFallthroughCasesInSwitch": false,
     "useUnknownInCatchVariables": true
   },
-  "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist", "packages"]
+  "include": [
+    "src/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "packages"
+  ]
 }

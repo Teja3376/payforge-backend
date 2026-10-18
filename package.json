@@ -1,7 +1,7 @@
 {
   "name": "@payforge/server",
   "version": "1.0.0",
-  "description": "PayForge — multi-currency payment orchestration platform.",
+  "description": "PayForge \u2014 multi-currency payment orchestration platform.",
   "author": "PayForge",
   "license": "UNLICENSED",
   "private": true,

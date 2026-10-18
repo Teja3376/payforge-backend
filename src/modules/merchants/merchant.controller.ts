@@ -11,6 +11,7 @@ import type { RequestUser } from '../../common/auth/request-user';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Authenticated, Roles } from '../../common/decorators/roles.decorator';
 import { Scopes } from '../../common/decorators/scopes.decorator';
+import { AllowPendingMerchant } from '../../common/decorators/pending-merchant.decorator';
 import { PaginationQueryDto } from '../../common/pagination/pagination';
 import { Scope } from '../../common/scopes/scopes';
 import { ApiErrorDto } from '../../common/swagger/api-error.dto';
@@ -24,8 +25,17 @@ import { MerchantService } from './merchant.service';
 export class MerchantController {
   constructor(private readonly merchants: MerchantService) {}
 
-  @Get('me')
+  // These routes are exempt from the merchant-ACTIVE guard.
+//
+// A merchant session inherits its merchant's status, so an unapproved merchant
+// cannot provision a payout destination or webhook endpoint — the guard exists
+// because live testing showed it doing exactly that. But a PENDING_REVIEW
+// merchant must be able to see its own state and submit its KYC, or there is no
+// path to becoming ACTIVE at all. These are the routes that make onboarding
+// possible, and they hold no money.
+@Get('me')
   @Roles(Role.MERCHANT)
+  @AllowPendingMerchant()
   @Authenticated()
   @ApiOperation({
     summary: 'Get your merchant profile',
@@ -39,6 +49,7 @@ export class MerchantController {
   @Patch('me')
   @Roles(Role.MERCHANT)
   @Scopes(Scope.MERCHANT_WRITE)
+  @AllowPendingMerchant()
   @Authenticated()
   @ApiOperation({
     summary: 'Update your merchant profile',
@@ -53,10 +64,12 @@ export class MerchantController {
 
   @Post('me/kyc')
   @Roles(Role.MERCHANT)
+  @AllowPendingMerchant()
   @Authenticated()
   @ApiOperation({
     summary: 'Submit KYC details',
-    description: 'Moves the KYC state to SUBMITTED for administrator review.',
+    description: 'Moves the KYC state to SUBMITTED for administrator review. ' +
+      'Required before a merchant can be approved — exempt from the ACTIVE guard.',
   })
   @ApiOkResponse({ type: MerchantResponseDto })
   async submitKyc(@CurrentUser() user: RequestUser, @Body() dto: KycSubmissionDto) {
@@ -66,10 +79,13 @@ export class MerchantController {
 
   @Post('me/fee-schedule')
   @Roles(Role.MERCHANT, Role.SUPER_ADMIN)
+  @AllowPendingMerchant()
   @Authenticated()
   @ApiOperation({
     summary: 'Set your fee schedule',
-    description: 'Applies to future payments. Existing payments keep the rate captured when they were created.',
+    description:
+      'Applies to future payments. Existing payments keep the rate captured when they were created. ' +
+      'Capped at 9900 bps — a 100% fee produces a zero net amount the ledger cannot represent.',
   })
   @ApiOkResponse({ type: MerchantResponseDto })
   async setFees(@CurrentUser() user: RequestUser, @Body() dto: FeeScheduleDto) {

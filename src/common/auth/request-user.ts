@@ -12,7 +12,13 @@ import { AccountStatus, ActorType, Role } from '@prisma/client';
  */
 export type RequestUser = {
   actorType: ActorType;
-  /** Users.id, or ApiKey.id for key-authenticated requests. */
+  /**
+   * The id of whatever authenticated: `Users.id` for a session JWT, or
+   * `ApiKey.id` for key authentication.
+   *
+   * This is an *actor* identity and is suitable for audit trails. It is NOT
+   * safe to write into a column that references `Users` — see `ownerUserId`.
+   */
   id: string;
   publicId: string;
   email: string | null;
@@ -22,6 +28,21 @@ export type RequestUser = {
   merchantId: string | null;
   /** Granted scopes. Always populated for API-key requests; empty for JWT. */
   scopes: string[];
+  /**
+   * A real `Users.id` that owns anything this principal creates.
+   *
+   * `Payments.userId`, `Transactions.userId` and `Resolution.actorId` are
+   * foreign keys onto `Users`. Writing an ApiKey id into them raised a foreign
+   * key violation, which surfaced as an opaque 500 on every money-write
+   * endpoint — so the merchant-server integration path, the one the OpenAPI
+   * description advertises, did not work at all with an API key.
+   *
+   * For a session this is the user themselves. For an API key it is the
+   * merchant's owner account, which also makes idempotency merchant-scoped:
+   * two different keys on the same merchant writing the same order key
+   * collapse onto one row rather than minting two payments.
+   */
+  ownerUserId: string;
   /**
    * The `sid` claim of the presented JWT, i.e. the Session row it belongs to.
    *

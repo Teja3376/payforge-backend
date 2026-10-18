@@ -251,6 +251,33 @@ export class SettlementService {
     if (!payment) {
       throw ApiError.of(ErrorCode.PAYMENT_NOT_FOUND);
     }
+
+    // Replay check FIRST, before any guard that reads current payment state.
+    //
+    // These guards are evaluated against state the *first* attempt already
+    // changed: a full refund moves the payment to REFUNDED, so a retry of a
+    // successful full refund used to be rejected with PAYMENT_NOT_REFUNDABLE
+    // before the idempotency key was ever consulted. A client that retries on
+    // any error then sees a failure for work that genuinely succeeded, which is
+    // how "safe" retries end up looking like lost refunds.
+    const replayed = await this.findRefundByKey(payment.merchantId, input.idempotencyKey);
+    if (replayed) {
+      const requestedForReplay = input.amountMinor ?? replayed.amount;
+      if (requestedForReplay !== replayed.amount) {
+        throw ApiError.of(
+          ErrorCode.IDEMPOTENCY_PAYLOAD_MISMATCH,
+          'That idempotency key was already used for a refund of a different amount.',
+          {
+            meta: {
+              originalAmount: replayed.amount.toString(),
+              requestedAmount: requestedForReplay.toString(),
+            },
+          },
+        );
+      }
+      return replayed;
+    }
+
     if (
       payment.status !== PaymentStatus.SUCCESS &&
       payment.status !== PaymentStatus.PARTIALLY_REFUNDED
@@ -420,6 +447,22 @@ export class SettlementService {
   }
 
   /**
+ * Find an existing refund for this merchant and idempotency key.
+ *
+ * This is the read half of idempotency. The unique constraint on
+ * (merchantId, idempotencyKey) is the write half and catches the race; this
+ * turns an exact replay into the original result rather than a 409.
+ */
+private async findRefundByKey(
+    merchantId: string,
+    idempotencyKey: string,
+  ): Promise<Refund | null> {
+    return this.prisma.refund.findUnique({
+      where: { merchantId_idempotencyKey: { merchantId, idempotencyKey } },
+    });
+  }
+
+  /**
    * Reserve a refund's idempotency key before the provider is contacted.
    *
    * Committed on its own so the reservation outlives the bank call. On a
@@ -442,14 +485,10 @@ export class SettlementService {
     netReversed: bigint;
     currency: string;
   }): Promise<{ replayed: boolean; refund: Refund }> {
-    const existing = await this.prisma.refund.findUnique({
-      where: {
-        merchantId_idempotencyKey: {
-          merchantId: input.payment.merchantId,
-          idempotencyKey: input.input.idempotencyKey,
-        },
-      },
-    });
+    const existing = await this.findRefundByKey(
+      input.payment.merchantId,
+      input.input.idempotencyKey,
+    );
     if (existing) {
       // A different amount under a reused key is a client bug, not a retry.
       if (existing.amount !== input.requested) {
@@ -488,14 +527,10 @@ export class SettlementService {
       // Lost the race against a concurrent request with the same key. The
       // winner owns the refund; return theirs rather than failing the caller.
       if (isUniqueViolation(error)) {
-        const raced = await this.prisma.refund.findUnique({
-          where: {
-            merchantId_idempotencyKey: {
-              merchantId: input.payment.merchantId,
-              idempotencyKey: input.input.idempotencyKey,
-            },
-          },
-        });
+        const raced = await this.findRefundByKey(
+          input.payment.merchantId,
+          input.input.idempotencyKey,
+        );
         if (raced) {
           return { replayed: true, refund: raced };
         }
@@ -572,18 +607,32 @@ export class SettlementService {
     tx: Prisma.TransactionClient,
     input: { merchantId: string; currency: string; referenceId: string; fee: bigint; net: bigint },
   ) {
-    const balanceAfter = await applyBalance(tx, input.merchantId, input.currency, input.net, 'decrement');
+    const balanceAfter =
+      input.net > 0n
+        ? await applyBalance(tx, input.merchantId, input.currency, input.net, 'decrement')
+        : null;
 
-    await writeLedger(tx, {
-      account: LedgerAccount.MERCHANT,
-      accountKey: input.merchantId,
-      merchantId: input.merchantId,
-      currency: input.currency,
-      amount: input.net,
-      type: LedgerType.DEBIT,
-      referenceId: input.referenceId,
-      balanceAfter,
-    });
+    // Both legs are omitted when zero.
+    //
+    // Cumulative rounding can legitimately attribute a whole slice to fee: on
+    // the final refund of a 3-minor-unit payment refunded 1/1/1, the last slice
+    // carries fee 1 and net 0. `Ledgers` carries CHECK (amount > 0), so writing
+    // that zero leg aborted the transaction and made the final refund
+    // impossible — the exact failure this whole change set was meant to remove.
+    // A zero leg carries no information: the clearing leg still records the
+    // full part, so the reference continues to balance.
+    if (input.net > 0n) {
+      await writeLedger(tx, {
+        account: LedgerAccount.MERCHANT,
+        accountKey: input.merchantId,
+        merchantId: input.merchantId,
+        currency: input.currency,
+        amount: input.net,
+        type: LedgerType.DEBIT,
+        referenceId: input.referenceId,
+        balanceAfter,
+      });
+    }
 
     if (input.fee > 0n) {
       await applyPlatform(tx, input.currency, input.fee, 'decrement');

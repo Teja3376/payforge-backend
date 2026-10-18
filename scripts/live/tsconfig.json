@@ -3,7 +3,6 @@
     "module": "commonjs",
     "moduleResolution": "node",
     "esModuleInterop": true,
-    "allowSyntheticDefaultImports": true,
     "resolveJsonModule": true,
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true,
@@ -13,7 +12,7 @@
     "strictNullChecks": true,
     "noImplicitAny": false,
     "useUnknownInCatchVariables": true,
-    "types": ["node", "jest"]
+    "types": ["node"]
   },
-  "include": ["../src/**/*.ts", "./**/*.ts"]
+  "include": ["./**/*.ts", "../../src/**/*.ts"]
 }

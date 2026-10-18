@@ -96,17 +96,6 @@ export class PayoutController {
     });
   }
 
-  @Get(':publicId')
-  @Roles(Role.MERCHANT, Role.SUPER_ADMIN)
-  @Scopes(Scope.PAYOUTS_READ)
-  @Authenticated()
-  @ApiOperation({ summary: 'Get one payout' })
-  @ApiParam({ name: 'publicId', example: 'PF-PO-A1B2C3D4E5F6' })
-  @ApiOkResponse({ type: PayoutResponseDto })
-  @ApiNotFoundResponse({ type: ApiErrorDto })
-  get(@CurrentUser() user: RequestUser, @Param('publicId') publicId: string) {
-    return this.payouts.get(user.merchantId!, assertPublicId(publicId));
-  }
 
   @Post('destinations')
   @Roles(Role.MERCHANT, Role.SUPER_ADMIN)
@@ -154,6 +143,13 @@ export class PayoutController {
     };
   }
 
+  // Declared before `@Get(':publicId')` on purpose.
+  //
+  // Express matches routes in declaration order, so the parameterised route
+  // swallowed this literal path: GET /payouts/destinations hit
+  // assertPublicId('destinations') and returned 400 "That id is not valid." A
+  // merchant could add a payout bank account but never list it, and so never
+  // learned the destinationId that POST /payouts requires.
   @Get('destinations')
   @Roles(Role.MERCHANT, Role.SUPER_ADMIN)
   @Scopes(Scope.PAYOUTS_READ)
@@ -175,5 +171,16 @@ export class PayoutController {
       isDefault: row.isDefault,
       createdAt: row.createdAt,
     }));
+  }
+  @Get(':publicId')
+  @Roles(Role.MERCHANT, Role.SUPER_ADMIN)
+  @Scopes(Scope.PAYOUTS_READ)
+  @Authenticated()
+  @ApiOperation({ summary: 'Get one payout' })
+  @ApiParam({ name: 'publicId', example: 'PF-PO-A1B2C3D4E5F6' })
+  @ApiOkResponse({ type: PayoutResponseDto })
+  @ApiNotFoundResponse({ type: ApiErrorDto })
+  get(@CurrentUser() user: RequestUser, @Param('publicId') publicId: string) {
+    return this.payouts.get(user.merchantId!, assertPublicId(publicId));
   }
 }

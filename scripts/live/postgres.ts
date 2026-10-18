@@ -4,22 +4,17 @@ import { join, resolve } from 'node:path';
 import { Client } from 'pg';
 
 /**
- * Boots a real PostgreSQL instance for the integration suite.
+ * Boots a real PostgreSQL instance for API-level testing.
  *
  * The unit suite cannot prove the things that matter most about money, because
  * it never touches a database. Unique constraints, `SELECT … FOR UPDATE`,
- * compare-and-set under concurrency, partial unique indexes and CHECK
- * constraints are the mechanisms the ledger's correctness actually rests on —
- * and none of them exist in a mocked Prisma client.
+ * compare-and-set under concurrency and the CHECK constraints are the
+ * mechanisms the ledger's correctness rests on, and none of them exist in a
+ * mocked Prisma client — so these scenarios run against a real engine.
  *
- * The `postgres`, `initdb` and `pg_ctl` binaries ship as an npm package, so
- * this needs neither Homebrew nor Docker. The binaries are driven directly
- * rather than through the npm wrapper: that wrapper is ESM-only, which does
- * not survive Jest's CommonJS transform, and shelling out keeps the lifecycle
- * explicit and the failure messages readable.
- *
- * The data directory is removed on teardown, so this cannot collide with a
- * developer's own database or leave state behind.
+ * The binaries ship as an npm package (`@embedded-postgres/darwin-x64`), so
+ * this needs neither Homebrew nor Docker. A fixed port, a temp data directory
+ * removed on teardown, and trust-auth on loopback only.
  */
 const BIN_DIR = resolve(
   process.cwd(),
@@ -38,29 +33,47 @@ function bin(name: string): string {
   const path = join(BIN_DIR, name);
   if (!existsSync(path)) {
     throw new Error(
-      `PostgreSQL binary not found at ${path}. Run: npm install (the binaries ship as an npm package).`,
+      `PostgreSQL binary not found at ${path}. Run npm install — the binaries ship as an npm package.`,
     );
   }
   return path;
 }
 
-function run(command: string, args: string[]): string {
-  return execFileSync(command, args, {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
+let started = false;
+let reused = false;
+
+/** True when a cluster is already answering on the test port. */
+async function isListening(): Promise<boolean> {
+  const client = new Client({
+    connectionString: `postgresql://${TEST_USER}@127.0.0.1:${TEST_PORT}/postgres`,
+    connectionTimeoutMillis: 2000,
   });
+  try {
+    await client.connect();
+    await client.end();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-let started = false;
-
+/**
+ * Start (or adopt) the cluster.
+ *
+ * When `scripts/live-stack.sh start` is already holding the port this reuses it
+ * rather than failing on a clash — the unit suite must not fight the live
+ * server for a database.
+ */
 export async function startDatabase(): Promise<string> {
   if (started) return TEST_DATABASE_URL;
+  if (await isListening()) {
+    reused = true;
+    return TEST_DATABASE_URL;
+  }
 
   rmSync(DATA_DIR, { recursive: true, force: true });
 
-  // Trust auth on loopback only: this is a throwaway cluster that never leaves
-  // the machine, and a password would only add friction.
-  run(bin('initdb'), [
+  execFileSync(bin('initdb'), [
     '-D', DATA_DIR,
     '-U', TEST_USER,
     '--auth=trust',
@@ -68,11 +81,11 @@ export async function startDatabase(): Promise<string> {
     '-E', 'UTF8',
   ]);
 
-  run(bin('pg_ctl'), [
+  execFileSync(bin('pg_ctl'), [
     '-D', DATA_DIR,
     '-l', join(DATA_DIR, 'server.log'),
     '-o', `-p ${TEST_PORT} -h 127.0.0.1 -k ${DATA_DIR}`,
-    '-w', // wait until accepting connections
+    '-w',
     'start',
   ]);
 
@@ -87,10 +100,15 @@ export async function startDatabase(): Promise<string> {
   return TEST_DATABASE_URL;
 }
 
+/** Stop the cluster — unless we adopted it, in which case leave it running. */
 export async function stopDatabase(): Promise<void> {
+  if (reused) {
+    reused = false;
+    return;
+  }
   if (!started) return;
   try {
-    run(bin('pg_ctl'), ['-D', DATA_DIR, '-m', 'immediate', '-w', 'stop']);
+    execFileSync(bin('pg_ctl'), ['-D', DATA_DIR, '-m', 'immediate', '-w', 'stop']);
   } catch {
     // A database that already died is not a test failure at teardown.
   }
@@ -98,4 +116,8 @@ export async function stopDatabase(): Promise<void> {
   started = false;
 }
 
-export default { startDatabase, stopDatabase, TEST_DATABASE_URL };
+export function isReused(): boolean {
+  return reused;
+}
+
+export default { startDatabase, stopDatabase, isReused, TEST_DATABASE_URL };

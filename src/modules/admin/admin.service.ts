@@ -343,18 +343,25 @@ export class AdminService {
     // A merchant can be onboarded in PayForge and still be restricted at the
     // provider. Recording the external state is what stops us taking money for
     // someone the PSP will not actually process.
+    //
+    // This must fail CLOSED. The guard was previously written as
+    // `merchant.providerAccount && (...)`, which meant a merchant with *no*
+    // provider row — the default state for every newly registered merchant —
+    // skipped the check entirely and went ACTIVE. Live testing confirmed it:
+    // a merchant was approved 13 seconds before any provider account existed.
     if (
-      merchant.providerAccount &&
-      (!merchant.providerAccount.chargesEnabled || !merchant.providerAccount.payoutsEnabled)
+      !merchant.providerAccount?.chargesEnabled ||
+      !merchant.providerAccount?.payoutsEnabled
     ) {
       throw ApiError.of(
         ErrorCode.VALIDATION_FAILED,
         'The payment provider has not enabled charging and payouts for this merchant.',
         {
           meta: {
-            chargesEnabled: merchant.providerAccount.chargesEnabled,
-            payoutsEnabled: merchant.providerAccount.payoutsEnabled,
-            onboardingStatus: merchant.providerAccount.onboardingStatus,
+            providerConfigured: Boolean(merchant.providerAccount),
+            chargesEnabled: merchant.providerAccount?.chargesEnabled ?? false,
+            payoutsEnabled: merchant.providerAccount?.payoutsEnabled ?? false,
+            onboardingStatus: merchant.providerAccount?.onboardingStatus ?? 'NOT_STARTED',
           },
         },
       );

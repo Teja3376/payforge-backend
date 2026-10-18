@@ -43,7 +43,15 @@ export function signWebhook(body: WebhookBody, secret: string): string {
   return createHmac('sha256', secret).update(canonicalWebhookBody(body)).digest('hex');
 }
 
-export type VerifyResult = { valid: true } | { valid: false; reason: 'missing' | 'malformed' | 'mismatch' | 'expired' };
+export type VerifyResult = {
+  valid: true;
+} | {
+  valid: false;
+  // `bad_timestamp` was added because an absent or non-numeric timestamp used
+  // to produce NaN, and `NaN > tolerance` is false — so the replay window
+  // never fired for exactly the requests that had no timestamp at all.
+  reason: 'missing' | 'malformed' | 'mismatch' | 'expired' | 'bad_timestamp';
+};
 
 export function verifyWebhook(
   body: WebhookBody,
@@ -53,6 +61,15 @@ export function verifyWebhook(
 ): VerifyResult {
   if (!signature) {
     return { valid: false, reason: 'missing' };
+  }
+
+  // A missing or non-numeric timestamp must be rejected before the age check.
+  //
+  // `Math.abs(now/1000 - undefined)` is NaN, and `NaN > tolerance` is false,
+  // so an unsigned-timestamp body sailed straight through the replay window
+  // and was accepted indefinitely. Live testing hit exactly this.
+  if (typeof body.timestamp !== 'number' || !Number.isFinite(body.timestamp)) {
+    return { valid: false, reason: 'bad_timestamp' };
   }
 
   const ageSeconds = Math.abs(now / 1000 - body.timestamp);

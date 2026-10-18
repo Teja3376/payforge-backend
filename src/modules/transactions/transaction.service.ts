@@ -184,7 +184,7 @@ export class TransactionService {
 
     // Idempotency is checked before the bank call so a retry never charges twice.
     const existing = await this.prisma.transactions.findUnique({
-      where: { userId_idempotencyKey: { userId: user.id, idempotencyKey } },
+      where: { userId_idempotencyKey: { userId: user.ownerUserId, idempotencyKey } },
       include: transactionInclude,
     });
     if (existing) {
@@ -250,7 +250,7 @@ export class TransactionService {
 
           const data = {
             publicId: generatePublicId('pf-trx'),
-            userId: user.id,
+            userId: user.ownerUserId,
             paymentId: payment.id,
             status: TransactionStatus.PENDING,
             gatewayRef,
@@ -281,7 +281,7 @@ export class TransactionService {
         // Either the idempotency key raced, or the open-transaction index
         // fired. Both are recoverable: re-read and decide.
         const raced = await this.prisma.transactions.findUnique({
-          where: { userId_idempotencyKey: { userId: user.id, idempotencyKey } },
+          where: { userId_idempotencyKey: { userId: user.ownerUserId, idempotencyKey } },
           include: transactionInclude,
         });
         if (raced) {
@@ -354,7 +354,7 @@ export class TransactionService {
     if (user.role === Role.MERCHANT) {
       return { payment: { merchantId: user.merchantId ?? 'none' } };
     }
-    return { userId: user.id };
+    return { userId: user.ownerUserId };
   }
 
   private canSee(

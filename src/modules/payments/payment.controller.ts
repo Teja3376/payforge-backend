@@ -82,16 +82,6 @@ export class PaymentController {
     });
   }
 
-  @Get(':publicId')
-  @Roles(Role.USER, Role.MERCHANT, Role.SUPER_ADMIN)
-  @Authenticated()
-  @ApiOperation({ summary: 'Get one payment' })
-  @ApiParam({ name: 'publicId', example: 'PF-PAY-A1B2C3D4E5F6' })
-  @ApiOkResponse({ type: PaymentResponseDto })
-  @ApiNotFoundResponse({ type: ApiErrorDto })
-  get(@CurrentUser() user: RequestUser, @Param('publicId') publicId: string) {
-    return this.payments.getPayment(user, assertPublicId(publicId));
-  }
 
   @Post(':publicId/cancel')
   @Roles(Role.USER, Role.MERCHANT, Role.SUPER_ADMIN)
@@ -162,6 +152,25 @@ export class PaymentController {
   @ApiOkResponse({ type: SavedPaymentMethodResponseDto, isArray: true })
   listMethods(@CurrentUser() user: RequestUser, @Query('customerRef') customerRef?: string) {
     return this.clientSessions.listPaymentMethods(user.merchantId!, customerRef);
+  }
+
+  // Declared last on purpose.
+  //
+  // Express matches routes in declaration order, so `@Get(':publicId')` placed
+  // above this swallowed the literal path: GET /payments/payment-methods hit
+  // assertPublicId('payment-methods') and returned 400 "That id is not valid."
+  // Compounding it, Scope.PAYMENTS_READ was enforced at exactly one route in
+  // the whole codebase — this one — so the scope was offered to merchants,
+  // grantable, and enforced nowhere reachable.
+  @Get(':publicId')
+  @Roles(Role.USER, Role.MERCHANT, Role.SUPER_ADMIN)
+  @Authenticated()
+  @ApiOperation({ summary: 'Get one payment' })
+  @ApiParam({ name: 'publicId', example: 'PF-PAY-A1B2C3D4E5F6' })
+  @ApiOkResponse({ type: PaymentResponseDto })
+  @ApiNotFoundResponse({ type: ApiErrorDto })
+  get(@CurrentUser() user: RequestUser, @Param('publicId') publicId: string) {
+    return this.payments.getPayment(user, assertPublicId(publicId));
   }
 }
 

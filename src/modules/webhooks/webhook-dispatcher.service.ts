@@ -332,10 +332,7 @@ export class WebhookDispatcher implements OnModuleInit {
         // A 4xx (except 408/429) means the request itself is wrong. Retrying
         // the identical body seven more times cannot succeed and only delays
         // the operator finding out.
-        await this.markDead(
-          deliveryId,
-          `HTTP ${statusCode}: ${detail}`,
-        );
+        await this.markDead(deliveryId, `HTTP ${statusCode}: ${detail}`, statusCode);
         await this.recordFailure(delivery.endpointId);
         return;
       }
@@ -367,7 +364,11 @@ export class WebhookDispatcher implements OnModuleInit {
     retryAfterMs?: number,
   ) {
     if (attemptNumber >= MAX_ATTEMPTS) {
-      return this.markDead(deliveryId, reason);
+      // statusCode must be threaded through: markDead previously wrote only
+      // status and lastError, so every DEAD delivery reported
+      // lastStatusCode = null. That is the only path an operator debugs, and
+      // it is exactly where the status code was lost.
+      return this.markDead(deliveryId, reason, statusCode);
     }
 
     return this.prisma.$transaction(async (tx) => {
@@ -398,10 +399,17 @@ export class WebhookDispatcher implements OnModuleInit {
    * but never read, so a 404-ing endpoint burned a full retry budget per event
    * forever.
    */
-  private async markDead(deliveryId: string, reason: string) {
+  private async markDead(deliveryId: string, reason: string, statusCode: number | null = null) {
     const delivery = await this.prisma.webhookDelivery.update({
       where: { id: deliveryId },
-      data: { status: 'DEAD', lastError: reason.slice(0, 500) },
+      data: {
+        status: 'DEAD',
+        lastError: reason.slice(0, 500),
+        // Preserve the code that killed it. Without this every DEAD row read
+        // lastStatusCode = null, so a 401 was indistinguishable from a 403 or
+        // a schema rejection.
+        ...(statusCode != null ? { lastStatusCode: statusCode } : {}),
+      },
       select: { endpointId: true },
     });
 
