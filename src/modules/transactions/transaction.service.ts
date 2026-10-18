@@ -1,322 +1,204 @@
-import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
-import { PrismaService } from "src/database/prisma.service";
-import { CreateTransactionDto } from "./dto/create-transaction.dto";
-import { LedgerType, PaymentStatus, TransactionStatus, Transactions } from "@prisma/client";
-import { generatePublicId } from "src/common/utils/generate-public-id";
-import { toRupees } from "src/common/utils/format.money";
-import { logger } from "src/common/logger/logger";
+import {
+  BadGatewayException,
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  Inject,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import { AccountStatus, PaymentMethod, PaymentStatus, Prisma, Role, TransactionStatus } from '@prisma/client';
+import type { RequestUser } from '../../common/auth/request-user';
+import { PrismaService } from '../../database/prisma.service';
+import { generatePublicId } from '../../common/utils/generate-public-id';
+import { BANK_PORT, type BankPort } from '../bank/bank.port';
+import { validateCard } from './card-validation';
+import { CreateTransactionDto } from './dto/create-transaction.dto';
+import { payloadHash, SafeMethodDetails } from './payload-hash';
+import { presentTransaction, transactionInclude } from './transaction.presenter';
 
 @Injectable()
 export class TransactionService {
-    constructor(private readonly prisma: PrismaService) { }
+  constructor(
+    private readonly prisma: PrismaService,
+    @Inject(BANK_PORT) private readonly bank: BankPort,
+  ) {}
 
-    async createTransaction(dto: CreateTransactionDto) {
+  async createTransaction(user: RequestUser, dto: CreateTransactionDto) {
+    if (user.status !== AccountStatus.ACTIVE) {
+      throw new ForbiddenException('Suspended users cannot pay');
+    }
 
-        logger.info(`Create transaction request for payment ${dto.paymentPublicId} with method ${dto.method}`);
-        const existingTransaction = await this.prisma.transactions.findUnique({
-            where: { idempotencyKey: dto.idempotencyKey },
+    const payment = await this.prisma.payments.findUnique({
+      where: { publicId: dto.paymentPublicId },
+      include: { merchant: true, transactions: { select: { status: true, idempotencyKey: true } } },
+    });
+    if (!payment || payment.userId !== user.id) {
+      throw new NotFoundException('Payment not found');
+    }
+    if (payment.merchant.status !== AccountStatus.ACTIVE) {
+      throw new ForbiddenException('Merchant cannot receive payments');
+    }
+    if (payment.status === PaymentStatus.SUCCESS || payment.status === PaymentStatus.REFUNDED) {
+      throw new BadRequestException('Payment is already finalized');
+    }
+
+    const details = this.safeDetails(dto);
+    const hash = payloadHash({
+      paymentPublicId: dto.paymentPublicId,
+      method: dto.method,
+      details,
+    });
+
+    const existing = await this.prisma.transactions.findUnique({
+      where: { userId_idempotencyKey: { userId: user.id, idempotencyKey: dto.idempotencyKey } },
+      include: transactionInclude,
+    });
+    if (existing) {
+      if (existing.payloadHash !== hash) {
+        throw new ConflictException('Idempotency key was already used with a different payload');
+      }
+      return { replay: true, body: presentTransaction(existing) };
+    }
+
+    const openAttempt = payment.transactions.some(
+      (transaction) =>
+        transaction.status === TransactionStatus.PENDING || transaction.status === TransactionStatus.SUCCESS,
+    );
+    if (openAttempt) {
+      throw new ConflictException('Payment already has an open transaction');
+    }
+
+    let gatewayRef: string;
+    try {
+      const charge = await this.bank.createCharge();
+      gatewayRef = charge.gatewayRef;
+    } catch {
+      throw new BadGatewayException('Bank charge failed');
+    }
+
+    try {
+      const created = await this.prisma.$transaction(async (tx) => {
+        const transaction = await tx.transactions.create({
+          data: {
+            publicId: generatePublicId('pf-trx'),
+            user: { connect: { id: user.id } },
+            payment: { connect: { id: payment.id } },
+            status: TransactionStatus.PENDING,
+            gatewayRef,
+            idempotencyKey: dto.idempotencyKey,
+            payloadHash: hash,
+            currency: payment.settlementCurrency,
+            amount: payment.settlementAmount,
+            ...this.detailCreate(dto, details),
+          },
+          include: transactionInclude,
         });
-
-        // Idempotency hit
-        if (existingTransaction) {
-            logger.info(`Idempotency hit for idempotency key ${dto.idempotencyKey}`);
-
-            return {
-                status: true,
-                message: 'Transaction already exists',
-                data: {
-                    publicId: existingTransaction.publicId,
-                    paymentId: dto.paymentPublicId,
-                    method: existingTransaction.method,
-                    amount: toRupees(existingTransaction.amount),
-                    status: existingTransaction.status,
-                    gatewayRef: existingTransaction.gatewayRef,
-                    createdAt: existingTransaction.createdAt,
-                }
-            };
-        }
-
-        const payment = await this.prisma.payments.findUnique({
-            where: { publicId: dto.paymentPublicId },
+        await tx.payments.update({
+          where: { id: payment.id },
+          data: { status: PaymentStatus.PENDING },
         });
-
-        // Error log
-        if (!payment) {
-            logger.error(`Payment not found for public ID ${dto.paymentPublicId}`);
-
-            throw new NotFoundException({
-                status: false,
-                message: 'Payment not found',
-                data: {},
-            });
-        }
-
-        if (payment.status === PaymentStatus.SUCCESS) {
-            throw new BadRequestException('Payment already successful');
-        }
-
-        if (payment.status === PaymentStatus.FAILED) {
-            throw new BadRequestException('Payment already failed');
-        }
-
-        const publicId = generatePublicId('pf-trx');
-
-        const transaction: Transactions = await this.prisma.$transaction(async (tx) => {
-            let created: Transactions;
-
-            try {
-                created = await tx.transactions.create({
-                    data: {
-                        publicId,
-                        paymentId: payment.id,
-                        method: dto.method,
-                        status: TransactionStatus.PENDING,
-                        gatewayRef: generatePublicId('pf-gw'),
-                        amount: payment.amount,
-                        idempotencyKey: dto.idempotencyKey,
-                    },
-                });
-            } catch (error: any) {
-                if (error.code === 'P2002') {
-                    // Race condition log
-                    logger.warn(`Duplicate idempotency key ${dto.idempotencyKey}`);
-
-                    const existing = await tx.transactions.findUnique({
-                        where: { idempotencyKey: dto.idempotencyKey },
-                    });
-
-                    return existing!;
-                }
-
-                throw error;
-            }
-
-            await tx.payments.update({
-                where: { id: payment.id },
-                data: { status: PaymentStatus.PENDING },
-            });
-
-            return created;
+        return transaction;
+      }, { maxWait: 10000, timeout: 20000 });
+      return { replay: false, body: presentTransaction(created) };
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        const raced = await this.prisma.transactions.findUnique({
+          where: { userId_idempotencyKey: { userId: user.id, idempotencyKey: dto.idempotencyKey } },
+          include: transactionInclude,
         });
+        if (raced && raced.payloadHash === hash) {
+          return { replay: true, body: presentTransaction(raced) };
+        }
+        throw new ConflictException('Idempotency key was already used with a different payload');
+      }
+      throw error;
+    }
+  }
 
-        // Final success log
-        logger.info(`Transaction created with public ID ${transaction.publicId}`);
+  async getTransaction(user: RequestUser, publicId: string) {
+    const transaction = await this.prisma.transactions.findUnique({
+      where: { publicId },
+      include: transactionInclude,
+    });
+    if (!transaction || !this.canSee(user, transaction.payment)) {
+      throw new NotFoundException('Transaction not found');
+    }
+    return presentTransaction(transaction);
+  }
 
+  async listTransactions(user: RequestUser) {
+    const transactions = await this.prisma.transactions.findMany({
+      where: this.scope(user),
+      include: transactionInclude,
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+    });
+    return transactions.map((transaction) => presentTransaction(transaction));
+  }
+
+  private scope(user: RequestUser): Prisma.TransactionsWhereInput {
+    if (user.role === Role.SUPER_ADMIN) {
+      return {};
+    }
+    if (user.role === Role.MERCHANT) {
+      return { payment: { merchantId: user.merchantId ?? 'none' } };
+    }
+    return { userId: user.id };
+  }
+
+  private canSee(user: RequestUser, payment: { userId: string; merchantId: string }) {
+    if (user.role === Role.SUPER_ADMIN) {
+      return true;
+    }
+    if (user.role === Role.MERCHANT) {
+      return payment.merchantId === user.merchantId;
+    }
+    return payment.userId === user.id;
+  }
+
+  private safeDetails(dto: CreateTransactionDto): SafeMethodDetails {
+    switch (dto.method) {
+      case PaymentMethod.CARD: {
+        const card = validateCard(dto.card!.cardNumber, dto.card!.cvv);
         return {
-            status: true,
-            message: 'Transaction created successfully',
-            data: {
-                publicId: transaction.publicId,
-                paymentId: payment.publicId,
-                method: transaction.method,
-                amount: toRupees(transaction.amount),
-                status: transaction.status,
-                gatewayRef: transaction.gatewayRef,
-                createdAt: transaction.createdAt,
-            }
+          holderName: dto.card!.holderName,
+          brand: card.brand,
+          last4: card.last4,
+          expiryMonth: dto.card!.expiryMonth,
+          expiryYear: dto.card!.expiryYear,
         };
+      }
+      case PaymentMethod.UPI:
+        return { vpa: dto.upi!.vpa };
+      case PaymentMethod.NET_BANKING:
+        return { bankCode: dto.netBanking!.bankCode };
+      case PaymentMethod.WALLET:
+        return { provider: dto.wallet!.provider };
     }
+  }
 
-    async updateTransaction(publicId: string, status: TransactionStatus) {
-        logger.info(`Updating transaction with public ID ${publicId} to status ${status}`);
-        const transaction = await this.prisma.transactions.findUnique({
-            where: { publicId },
-            include: {
-                payment: {
-                    select: {
-                        amount: true,
-                        publicId: true,
-                    },
-                },
-            },
-        })
-        if (!transaction) {
-            logger.error(`Transaction not found for public ID ${publicId}`);
-            throw new NotFoundException({
-                status: false,
-                message: 'Transaction not found',
-                data: {},
-            })
-        }
-
-        // Preventing the transaction status from being updated if it is already successful or failed
-        if (transaction.status === TransactionStatus.SUCCESS || transaction.status === TransactionStatus.FAILED) {
-            logger.error(`Transaction is already finalized for public ID ${publicId}`);
-            throw new BadRequestException({
-                status: false,
-                message: 'Transaction is already Finalized',
-                data: {},
-            })
-        }
-
-        let paymentStatus: PaymentStatus | null = null;
-        if (status === TransactionStatus.SUCCESS) paymentStatus = PaymentStatus.SUCCESS;
-        if (status === TransactionStatus.FAILED) paymentStatus = PaymentStatus.FAILED;
-        if (status === TransactionStatus.PENDING) paymentStatus = PaymentStatus.PENDING;
-
-        logger.info(`Updating transaction status to ${status} for payment ${transaction.payment.publicId}`);
-        const updatedTransaction = await this.prisma.$transaction(async (tx) => {
-
-            const updated = await tx.transactions.update({
-                where: { id: transaction.id },
-                data: { status },
-                include: {
-                    payment: {
-                        select: {
-                            publicId: true,
-                            amount: true,
-                        },
-                    },
-                },
-            });
-
-            if (paymentStatus) {
-                await tx.payments.update({
-                    where: { id: transaction.paymentId },
-                    data: { status: paymentStatus },
-                });
-            }
-
-            // Add this block
-            if (status === TransactionStatus.SUCCESS) {
-
-                const payment = await tx.payments.findUnique({
-                    where: { id: transaction.paymentId },
-                    select: { merchantId: true, amount: true },
-                });
-
-                const amount = payment!.amount;
-
-                // Fee logic
-                const fee = Math.floor(Number(amount) * 0.02); // 2%
-                const netAmount = Number(amount) - fee;
-
-                // Save fee + net in transaction
-                await tx.transactions.update({
-                    where: { id: transaction.id },
-                    data: {
-                        fee,
-                        netAmount,
-                    },
-                });
-
-                // Ledger (ONLY NET)
-                await tx.ledgers.create({
-                    data: {
-                        publicId: generatePublicId('pf-ledger'),
-                        merchantId: payment!.merchantId,
-                        amount: netAmount,
-                        type: LedgerType.CREDIT,
-                        referenceId: transaction.publicId,
-                    }
-                });
-
-                // Balance (ONLY NET)
-                await tx.merchants.update({
-                    where: { id: payment!.merchantId },
-                    data: {
-                        balance: {
-                            increment: netAmount,
-                        },
-                    },
-                });
-            }
-
-            return updated;
-        });
-        // return transaction
+  private detailCreate(dto: CreateTransactionDto, details: SafeMethodDetails) {
+    switch (dto.method) {
+      case PaymentMethod.CARD:
         return {
-            status: true,
-            message: 'Transaction updated successfully',
-            data: {
-                publicId: updatedTransaction.publicId,
-                paymentId: updatedTransaction.payment.publicId,
-                method: updatedTransaction.method,
-                amount: toRupees(updatedTransaction.payment.amount),
-                status: updatedTransaction.status,
-                gatewayRef: updatedTransaction.gatewayRef,
-                createdAt: updatedTransaction.createdAt,
-            }
-        }
-    }
-
-    async getTransaction(publicId: string) {
-        const transaction = await this.prisma.transactions.findUnique({
-            where: { publicId },
-            include: {
-                payment: {
-                    select: {
-                        publicId: true,
-                        amount: true,
-                    },
-                },
+          method: dto.method,
+          cardDetail: {
+            create: {
+              holderName: details.holderName!,
+              brand: details.brand!,
+              last4: details.last4!,
+              expiryMonth: details.expiryMonth!,
+              expiryYear: details.expiryYear!,
             },
-        })
-        if (!transaction) {
-            logger.error(`Transaction not found for public ID ${publicId}`);
-            throw new NotFoundException({
-                status: false,
-                message: 'Transaction not found',
-                data: {},
-            })
-        }
-        return {
-            status: true,
-            message: 'Transaction found',
-            data: {
-                publicId: transaction.publicId,
-                paymentId: transaction.payment.publicId,
-                method: transaction.method,
-                amount: toRupees(transaction.payment.amount),
-                status: transaction.status,
-                gatewayRef: transaction.gatewayRef,
-                createdAt: transaction.createdAt,
-            }
-        }
-    }
-    async getAllTransactions(cursor?: string, limit = 10) {
-
-        const transactions = await this.prisma.transactions.findMany({
-            take: limit,
-            skip: cursor ? 1 : 0,
-            cursor: cursor ? { publicId: cursor } : undefined,
-            orderBy: {
-                createdAt: "desc",
-            },
-            select: {
-                publicId: true,
-                method: true,
-                status: true,
-                gatewayRef: true,
-                createdAt: true,
-                payment: {
-                    select: {
-                        publicId: true,
-                        amount: true,
-                    },
-                },
-            },
-        });
-
-        const nextCursor =
-            transactions.length > 0
-                ? transactions[transactions.length - 1].publicId
-                : null;
-
-        return {
-            status: true,
-            message: 'Transactions fetched successfully',
-            data: transactions.map((t) => ({
-                publicId: t.publicId,
-                paymentId: t.payment.publicId,
-                method: t.method,
-                amount: toRupees(t.payment.amount),
-                status: t.status,
-                gatewayRef: t.gatewayRef,
-                createdAt: t.createdAt,
-            })),
-            nextCursor,
+          },
         };
+      case PaymentMethod.UPI:
+        return { method: dto.method, upiDetail: { create: { vpa: details.vpa! } } };
+      case PaymentMethod.NET_BANKING:
+        return { method: dto.method, netBankingDetail: { create: { bankCode: details.bankCode! } } };
+      case PaymentMethod.WALLET:
+        return { method: dto.method, walletDetail: { create: { provider: details.provider! } } };
     }
-
+  }
 }

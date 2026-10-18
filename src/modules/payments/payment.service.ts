@@ -1,177 +1,139 @@
-import { Injectable, NotFoundException } from "@nestjs/common";
-import { PrismaService } from "src/database/prisma.service";
-import { CreatePaymentDto } from "./dto/create-payment.dto";
-import { generatePublicId } from "src/common/utils/generate-public-id";
-import { toPaisa, toRupees } from "src/common/utils/format.money";
-import { PaymentStatus } from "@prisma/client";
-import { logger } from "src/common/logger/logger";
+import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { AccountStatus, PaymentStatus, Prisma, Role } from '@prisma/client';
+import type { RequestUser } from '../../common/auth/request-user';
+import { toMajorNumber } from '../../common/money/money';
+import { generatePublicId } from '../../common/utils/generate-public-id';
+import { PrismaService } from '../../database/prisma.service';
+import { quoteSettlement } from '../fx/fx-math';
+import { FxService } from '../fx/fx.service';
+import { CreatePaymentDto } from './dto/create-payment.dto';
+
+const paymentSelect = {
+  publicId: true,
+  amount: true,
+  currency: true,
+  fxRateDate: true,
+  usdRate: true,
+  inrRate: true,
+  settlementAmount: true,
+  settlementCurrency: true,
+  status: true,
+  createdAt: true,
+  userId: true,
+  merchantId: true,
+  merchant: { select: { publicId: true, name: true } },
+  user: { select: { publicId: true } },
+} satisfies Prisma.PaymentsSelect;
+
+type PaymentRow = Prisma.PaymentsGetPayload<{ select: typeof paymentSelect }>;
 
 @Injectable()
 export class PaymentService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly fx: FxService,
+  ) {}
 
-    constructor(private readonly prisma: PrismaService) { }
-
-    async createPayment(dto: CreatePaymentDto) {
-
-        const publicId = generatePublicId('pf-pay')
-
-        const merchant = await this.prisma.merchants.findUnique({
-            where: { publicId: dto.merchantId },
-        })
-
-        if (!merchant) {
-            logger.error(`Merchant not found for public ID ${dto.merchantId}`);
-            throw new NotFoundException({
-                status: false,
-                message: 'Merchant not found',
-                data: null,
-            })
-        }
-
-        const amount = toPaisa(dto.amount)
-
-        const payment = await this.prisma.payments.create({
-            data: {
-                publicId,
-                merchantId: merchant.id,
-                payerName: dto.payerName,
-                payerEmail: dto.payerEmail,
-                countryCode: dto.countryCode,
-                payerPhone: dto.payerPhone,
-                amount,
-                currency: dto.currency,
-                status: PaymentStatus.CREATED,
-                metadata: dto.metadata,
-            },
-        })
-
-        logger.info(`Payment created with public ID ${publicId}`);
-        return {
-            status: true,
-            message: 'Payment created successfully',
-            data: {
-                ...payment,
-                amount: toRupees(payment.amount),
-            }
-        }
+  async createPayment(user: RequestUser, dto: CreatePaymentDto) {
+    if (user.status !== AccountStatus.ACTIVE) {
+      throw new ForbiddenException('Suspended users cannot pay');
     }
 
-    async getPayment(publicId: string) {
-
-        const payment = await this.prisma.payments.findUnique({
-            where: { publicId },
-            select: {
-                publicId: true,
-                payerName: true,
-                payerEmail: true,
-                countryCode: true,
-                payerPhone: true,
-                amount: true,
-                merchant: {
-                    select: {
-                        publicId: true,
-                        name: true,
-                        email: true,
-                    }
-                },
-                currency: true,
-                status: true,
-                createdAt: true,
-                updatedAt: true,
-                transactions: {
-                    select: {
-                        publicId: true,
-                        method: true,
-                        status: true,
-                    }
-                }
-            }
-        })
-
-        if (!payment) {
-            throw new NotFoundException({
-                status: false,
-                message: 'Payment not found',
-                data: null,
-            })
-        }
-
-        return {
-            status: true,
-            message: 'Payment fetched successfully',
-            data: {
-                ...payment,
-                amount: toRupees(payment.amount),
-            }
-        }
+    const merchant = await this.prisma.merchants.findUnique({
+      where: { publicId: dto.merchantPublicId },
+    });
+    if (!merchant) {
+      throw new NotFoundException('Merchant not found');
+    }
+    if (merchant.status !== AccountStatus.ACTIVE) {
+      throw new ForbiddenException('Merchant cannot receive payments');
     }
 
-    async getAllPayments(cursor?: string, limit = 2) {
-        const payments = await this.prisma.payments.findMany({
-            take: limit,
-            skip: cursor ? 1 : 0,
-            cursor: cursor ? { publicId: cursor } : undefined,
-            orderBy: {
-                createdAt: 'desc',
-            },
-            select: {
-                publicId: true,
-                payerName: true,
-                payerEmail: true,
-                countryCode: true,
-                payerPhone: true,
-                amount: true,
-                merchant: {
-                    select: {
-                        publicId: true,
-                        name: true,
-                        email: true,
-                    }
-                },
-                currency: true,
-                status: true,
-                createdAt: true,
-                updatedAt: true,
-                transactions: {
-                    select: {
-                        publicId: true,
-                        method: true,
-                        status: true,
-                    }
-                }
-            },
-        })
+    const snapshot = await this.fx.ratesForToday();
+    const quote = quoteSettlement({
+      majorAmount: dto.amount,
+      currency: dto.currency,
+      countryCode: user.countryCode,
+      rates: snapshot.rates,
+    });
 
-        const formatted = payments.map((p) => ({
-            publicId: p.publicId,
-            amount: toRupees(p.amount),
-            payerName: p.payerName,
-            payerEmail: p.payerEmail,
-            countryCode: p.countryCode,
-            payerPhone: p.payerPhone,
-            currency: p.currency,
-            status: p.status,
-            createdAt: p.createdAt,
-            updatedAt: p.updatedAt,
-            merchant: {
-              publicId: p.merchant.publicId,
-              name: p.merchant.name,
-              email: p.merchant.email,
-            },
-            transactions: p.transactions.map((t) => ({
-              publicId: t.publicId,
-              method: t.method,
-              status: t.status,
-            })),
-          }));
+    const payment = await this.prisma.payments.create({
+      data: {
+        publicId: generatePublicId('pf-pay'),
+        userId: user.id,
+        merchantId: merchant.id,
+        amount: quote.chargedMinor,
+        currency: dto.currency.toUpperCase(),
+        fxRateDate: snapshot.rateDate,
+        usdRate: quote.usdRate,
+        inrRate: quote.inrRate,
+        settlementAmount: quote.settlementMinor,
+        settlementCurrency: quote.settlementCurrency,
+        status: PaymentStatus.CREATED,
+      },
+      select: paymentSelect,
+    });
 
-        const nextCursor = payments.length > 0 ? payments[payments.length - 1].publicId : null;
+    return this.present(payment);
+  }
 
-        return {
-            status: true,
-            message: 'Payments fetched successfully',
-            data: formatted,
-            nextCursor,
-        }
+  async getPayment(user: RequestUser, publicId: string) {
+    const payment = await this.prisma.payments.findUnique({
+      where: { publicId },
+      select: paymentSelect,
+    });
+    if (!payment || !this.canSee(user, payment)) {
+      throw new NotFoundException('Payment not found');
     }
+    return this.present(payment);
+  }
+
+  async listPayments(user: RequestUser) {
+    const where = this.scope(user);
+    const payments = await this.prisma.payments.findMany({
+      where,
+      select: paymentSelect,
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+    });
+    return payments.map((payment) => this.present(payment));
+  }
+
+  private scope(user: RequestUser): Prisma.PaymentsWhereInput {
+    if (user.role === Role.SUPER_ADMIN) {
+      return {};
+    }
+    if (user.role === Role.MERCHANT) {
+      return { merchantId: user.merchantId ?? 'none' };
+    }
+    return { userId: user.id };
+  }
+
+  private canSee(user: RequestUser, payment: { userId: string; merchantId: string }) {
+    if (user.role === Role.SUPER_ADMIN) {
+      return true;
+    }
+    if (user.role === Role.MERCHANT) {
+      return payment.merchantId === user.merchantId;
+    }
+    return payment.userId === user.id;
+  }
+
+  private present(payment: PaymentRow) {
+    return {
+      publicId: payment.publicId,
+      merchantPublicId: payment.merchant.publicId,
+      merchantName: payment.merchant.name,
+      payerPublicId: payment.user.publicId,
+      amount: toMajorNumber(payment.amount, payment.currency),
+      currency: payment.currency,
+      fxRateDate: payment.fxRateDate.toISOString().slice(0, 10),
+      usdRate: payment.usdRate.toString(),
+      inrRate: payment.inrRate.toString(),
+      settlementAmount: toMajorNumber(payment.settlementAmount, payment.settlementCurrency),
+      settlementCurrency: payment.settlementCurrency,
+      status: payment.status,
+      createdAt: payment.createdAt,
+    };
+  }
 }

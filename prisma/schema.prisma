@@ -1,75 +1,199 @@
-// Prisma schema
-
 generator client {
   provider = "prisma-client-js"
 }
 
+generator client_local {
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
+}
+
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model Users {
+  id           String        @id @default(uuid())
+  publicId     String        @unique
+  email        String        @unique
+  passwordHash String
+  countryCode  String
+  role         Role
+  status       AccountStatus @default(ACTIVE)
+  merchantId   String?       @unique
+  createdAt    DateTime      @default(now())
+
+  merchant     Merchants?     @relation(fields: [merchantId], references: [id])
+  payments     Payments[]
+  transactions Transactions[]
+  resolutions  Resolution[]
 }
 
 model Merchants {
-  id        String   @id @default(uuid())
-  publicId  String   @unique
+  id        String        @id @default(uuid())
+  publicId  String        @unique
   name      String
-  email     String   @unique
-  balance   BigInt   @default(0)
-  createdAt DateTime @default(now())
+  email     String        @unique
+  status    AccountStatus @default(ACTIVE)
+  createdAt DateTime      @default(now())
 
+  user     Users?
   payments Payments[]
   ledgers  Ledgers[]
+  balances MerchantBalance[]
+}
+
+model MerchantBalance {
+  id         String    @id @default(uuid())
+  merchantId String
+  currency   String
+  balance    BigInt    @default(0)
+  merchant   Merchants @relation(fields: [merchantId], references: [id])
+
+  @@unique([merchantId, currency])
+}
+
+model PlatformAccount {
+  id       String @id @default(uuid())
+  currency String @unique
+  balance  BigInt @default(0)
+}
+
+model ExchangeRateSnapshot {
+  id        String   @id @default(uuid())
+  rateDate  DateTime @unique @db.Date
+  baseCode  String
+  rates     Json
+  fetchedAt DateTime @default(now())
 }
 
 model Payments {
-  id         String        @id @default(uuid())
-  publicId   String        @unique
-  merchantId String
-  amount     BigInt
-  currency   String
-  payerName  String?
-  payerEmail String?
-  countryCode String?
-  payerPhone String?
-  status     PaymentStatus
-  metadata   Json?
-  createdAt  DateTime      @default(now())
-  updatedAt  DateTime      @updatedAt
+  id                 String        @id @default(uuid())
+  publicId           String        @unique
+  userId             String
+  merchantId         String
+  amount             BigInt
+  currency           String
+  fxRateDate         DateTime      @db.Date
+  usdRate            Decimal       @db.Decimal(24, 10)
+  inrRate            Decimal       @db.Decimal(24, 10)
+  settlementAmount   BigInt
+  settlementCurrency String
+  status             PaymentStatus
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
 
+  user         Users          @relation(fields: [userId], references: [id])
   merchant     Merchants      @relation(fields: [merchantId], references: [id])
   transactions Transactions[]
 
+  @@index([userId])
   @@index([merchantId])
 }
 
 model Transactions {
   id             String            @id @default(uuid())
   publicId       String            @unique
+  userId         String
   paymentId      String
-  method         String
+  method         PaymentMethod
   status         TransactionStatus
   gatewayRef     String            @unique
-  idempotencyKey String            @unique
+  idempotencyKey String
+  payloadHash    String
+  currency       String
   amount         BigInt
   fee            BigInt            @default(0)
   netAmount      BigInt            @default(0)
   createdAt      DateTime          @default(now())
 
-  payment Payments @relation(fields: [paymentId], references: [id])
+  user             Users              @relation(fields: [userId], references: [id])
+  payment          Payments           @relation(fields: [paymentId], references: [id])
+  cardDetail       CardDetails?
+  upiDetail        UpiDetails?
+  netBankingDetail NetBankingDetails?
+  walletDetail     WalletDetails?
 
+  @@unique([userId, idempotencyKey])
   @@index([paymentId])
 }
 
+model CardDetails {
+  id            String    @id @default(uuid())
+  transactionId String    @unique
+  holderName    String
+  brand         CardBrand
+  last4         String
+  expiryMonth   Int
+  expiryYear    Int
+
+  transaction Transactions @relation(fields: [transactionId], references: [id])
+}
+
+model UpiDetails {
+  id            String @id @default(uuid())
+  transactionId String @unique
+  vpa           String
+
+  transaction Transactions @relation(fields: [transactionId], references: [id])
+}
+
+model NetBankingDetails {
+  id            String @id @default(uuid())
+  transactionId String @unique
+  bankCode      String
+
+  transaction Transactions @relation(fields: [transactionId], references: [id])
+}
+
+model WalletDetails {
+  id            String         @id @default(uuid())
+  transactionId String         @unique
+  provider      WalletProvider
+
+  transaction Transactions @relation(fields: [transactionId], references: [id])
+}
+
 model Ledgers {
-  id          String     @id @default(uuid())
-  publicId    String     @unique
-  merchantId  String
+  id          String         @id @default(uuid())
+  publicId    String         @unique
+  account     LedgerAccount
+  accountKey  String
+  merchantId  String?
+  currency    String
   amount      BigInt
   type        LedgerType
   referenceId String
-  createdAt   DateTime   @default(now())
+  createdAt   DateTime       @default(now())
 
-  merchant Merchants @relation(fields: [merchantId], references: [id])
+  merchant Merchants? @relation(fields: [merchantId], references: [id])
+
+  @@unique([account, accountKey, referenceId, type])
+  @@index([account, currency, createdAt])
+}
+
+model Resolution {
+  id              String              @id @default(uuid())
+  publicId        String              @unique
+  actorId         String
+  action          ResolutionAction
+  subjectType     ResolutionSubject
+  subjectPublicId String
+  createdAt       DateTime            @default(now())
+
+  actor Users @relation(fields: [actorId], references: [id])
+}
+
+enum Role {
+  USER
+  MERCHANT
+  SUPER_ADMIN
+}
+
+enum AccountStatus {
+  ACTIVE
+  SUSPENDED
 }
 
 enum PaymentStatus {
@@ -78,6 +202,7 @@ enum PaymentStatus {
   SUCCESS
   FAILED
   CANCELLED
+  REFUNDED
 }
 
 enum TransactionStatus {
@@ -91,4 +216,44 @@ enum TransactionStatus {
 enum LedgerType {
   CREDIT
   DEBIT
+}
+
+enum LedgerAccount {
+  MERCHANT
+  PLATFORM
+}
+
+enum ResolutionAction {
+  SUSPEND_MERCHANT
+  RESTORE_MERCHANT
+  SUSPEND_USER
+  RESTORE_USER
+  REFUND
+}
+
+enum ResolutionSubject {
+  USER
+  MERCHANT
+  PAYMENT
+}
+
+enum PaymentMethod {
+  CARD
+  UPI
+  NET_BANKING
+  WALLET
+}
+
+enum CardBrand {
+  VISA
+  MASTERCARD
+  RUPAY
+  AMEX
+}
+
+enum WalletProvider {
+  PAYTM
+  PHONEPE
+  AMAZON_PAY
+  MOBIKWIK
 }
