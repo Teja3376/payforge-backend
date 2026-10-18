@@ -1,0 +1,59 @@
+# Local development stack.
+#
+# Postgres 16 with point-in-time recovery enabled, because backup/restore is
+# only meaningful if the archive command is configured. scripts/backup.sh and
+# scripts/restore.sh operate against this instance.
+
+services:
+  db:
+    image: postgres:16-bookworm
+    container_name: payforge-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: payforge
+      POSTGRES_PASSWORD: payforge
+      POSTGRES_DB: payforge
+      # Required for point-in-time recovery, which is what makes
+      # `pgbackrest --delta` in restore.sh possible.
+      POSTGRES_INITDB_ARGS: '--data-checksums'
+    command:
+      - postgres
+      # Retain WAL segments for 7 days so PITR has a window to work within.
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=test ! -f /var/lib/postgresql/data/wal/%f && cp %p /var/lib/postgresql/data/wal/%f
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=3
+      - -c
+      - log_min_duration_statement=500
+    ports:
+      - '5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U payforge -d payforge']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      target: runtime
+    container_name: payforge-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://payforge:payforge@db:5432/payforge?schema=public
+    ports:
+      - '3000:3000'
+
+volumes:
+  pgdata:

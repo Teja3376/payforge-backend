@@ -531,32 +531,65 @@ bash scripts/e2e.sh    # 34 end-to-end checks against a running server
 
 ### Deployment checklist
 
+See **[docs/RUNBOOK.md](docs/RUNBOOK.md)** for the full procedure, incident
+playbooks and the metrics to alert on. The short version:
+
 - [ ] **Rotate every value in `.env`** that has been on a shared machine.
 - [ ] `ENABLE_DEV_TOOLS=false`. `POST /v1/dev/bank/settle` credits real
-      merchant balances and only accepts loopback requests when enabled.
+      merchant balances.
 - [ ] `NODE_ENV=production` — this unmounts `/docs`.
 - [ ] `CORS_ORIGINS` lists explicit origins (`*` is rejected at boot).
 - [ ] TLS terminates in front; HSTS set at the edge.
-- [ ] Database backups and point-in-time recovery verified.
-- [ ] A real `BANK_PORT` adapter is implemented. **Until you do, no money
-      actually moves.**
+- [ ] `scripts/backup.sh` run **and `scripts/restore.sh` rehearsed**. An
+      untested backup is not a backup.
+- [ ] Prometheus scraping `/v1/health/metrics`, alerting on
+      `payforge_ledger_imbalance_minor`.
+- [ ] Readiness (`/v1/health/ready`) wired to the orchestrator, liveness
+      (`/v1/health`) to the restart probe.
+- [ ] A real `BANK_PORT` adapter is implemented and exercised in its sandbox.
+      **Until you do, no money actually moves** — but payouts, refunds and
+      settlement will all call it correctly.
 
 ### Current limitations
 
-Worth knowing before you build on this:
+Honest list of what is still not production-complete:
 
 - **The bank adapter is a mock.** Nothing moves real money until you implement
-  a real PSP behind `BANK_PORT`.
-- **FX is a single provider, refreshed once daily.** One rate per UTC day; a
-  payment quoted at 00:01 and charged at 23:59 uses the same rate.
-- **Refunds reverse the internal ledger only.** A real adapter must also call
-  the bank; `BankPort.refund` exists but is unimplemented.
-- **The ledger is a two-sided revenue split**, not a fully balanced general
-  ledger — there is no payer or suspense account.
-- **No scheduled payouts yet.** `POST /payouts` debits the balance, leaves the row `SCHEDULED`, and still emits `PAYOUT_PAID`. The payout service does not call `BankPort.createPayout`.
-- **Approving a merchant is not the same as going live.** Status becomes `ACTIVE`. `mode` stays `TEST`. KYC can be submitted, and nothing in the API approves or rejects it. Payments do not wait for KYC.
-- **A merchant can set their own fee** from 0 to 10000 basis points. There is no admin review of that schedule.
-- **`@payforge/node` cannot create a payment or a charge.** Those routes require a customer access token, and the SDK sends only an API key.
+  a real PSP behind `BANK_PORT`. Payout execution, provider refunds, and
+  charge/refund status reconciliation are all wired to the port and will work
+  unchanged against a real adapter — but they have only been exercised against
+  the mock.
+- **`@payforge/react` needs the hosted-fields script.** It is not bundled,
+  because the iframe must come from whichever processor moves the money. See
+  the package README for the `<script>` tag.
+- **The charge amount is the settlement currency, not the currency the payer
+  was quoted.** A USD payer on an INR merchant is debited in INR. This needs a
+  product decision — either disclose it at the point of charge, or charge the
+  payer their quoted amount and absorb the FX.
+- **`settlementDelayDays` and `MerchantBalance.pending` are unused.** Settled
+  funds land directly in available balance, so a merchant can withdraw money
+  that is still inside the chargeback window. `pending` has no write site.
+- **A merchant can set their own platform fee** from 0 to 9900 basis points.
+  There is no admin review of that schedule.
+- **Charges still cross this server as raw PAN/CVV** on the legacy path
+  (`create-transaction.dto`). That keeps any deployment using it in PCI DSS
+  SAQ D scope. The tokenized and saved-method paths are the PCI-safe ones.
+- **No data retention.** Deliveries, sessions and login attempts grow without
+  bound.
+- **One provider, one FX source.** No secondary rate provider to fall back to.
+
+### What is production-shaped
+
+- BigInt minor units throughout, `decimal.js` only at the boundary
+- Double-entry ledger, append-only, enforced by a database trigger
+- `SELECT … FOR UPDATE` balance locks with consistent lock ordering
+- Compare-and-set on every money-affecting state transition
+- Unique idempotency constraints on payments, transactions, refunds and payouts
+- HMAC-SHA256 webhook signing with timestamp, event-id nonce and constant-time
+  comparison — contract-tested against the SDK
+- Reconciliation proving the journal balances, nightly
+- Scheduled payout execution with crash recovery
+- Two-phase refunds, so an irreversible provider call is never made speculatively
 
 ---
 

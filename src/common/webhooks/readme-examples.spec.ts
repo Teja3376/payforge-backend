@@ -16,8 +16,20 @@ describe('README examples', () => {
     expect(payforge).toBeInstanceOf(PayForge);
   });
 
-  it('rejects a client without an API key', () => {
-    expect(() => new PayForge({ apiKey: '' })).toThrow(/API key is required/);
+  it('rejects a client with no credential', () => {
+    expect(() => new PayForge({ apiKey: '' })).toThrow(/credential is required/i);
+  });
+
+  it('rejects a client carrying both credential types', () => {
+    // The server rejects a request with both, so failing at construction gives
+    // a useful message instead of a 401 on every call.
+    expect(
+      () => new PayForge({ apiKey: 'pf_test_x', accessToken: 'eyJhbGciOi' }),
+    ).toThrow(/not both/i);
+  });
+
+  it('accepts an access token in place of an API key', () => {
+    expect(() => new PayForge({ accessToken: 'eyJhbGciOi' })).not.toThrow();
   });
 
   // Recipe 1 — take a payment

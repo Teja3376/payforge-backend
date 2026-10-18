@@ -1,0 +1,108 @@
+name: CI
+
+# There was no CI at all. signing.contract.spec.ts claimed "a change to either
+# side that breaks the handshake fails CI" — there was no CI for it to fail.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-bookworm
+        env:
+          POSTGRES_USER: payforge
+          POSTGRES_PASSWORD: payforge
+          POSTGRES_DB: payforge_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U payforge -d payforge_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://payforge:payforge@localhost:5432/payforge_test?schema=public
+      JWT_SECRET: ci-jwt-secret-at-least-32-characters-long
+      ENCRYPTION_KEY: ci-encryption-key-at-least-32-chars
+      WEBHOOK_SIGNING_KEY: ci-webhook-key-at-least-32-characters
+      BANK_WEBHOOK_SECRET: ci-bank-webhook-secret-at-least-32-chars
+      MOCK_BANK_SECRET: ci-mock-bank-secret
+      WEBHOOK_SIGNING_TOLERANCE_SECONDS: '300'
+      ADMIN_EMAIL: ci-admin@payforge.test
+      ADMIN_PASSWORD: ci-admin-password-at-least-12-chars
+      NODE_ENV: test
+      ENABLE_DEV_TOOLS: 'false'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Apply migrations
+        run: npx prisma migrate deploy
+
+      # A change to schema.prisma with no matching migration means the deploy
+      # step would silently create drift, so this fails before that can happen.
+      - name: Fail on schema drift
+        run: |
+          npx prisma migrate diff \
+            --from-schema-datasource prisma/schema.prisma \
+            --to-schema-datamodel prisma/schema.prisma \
+            --exit-code
+
+      - name: Typecheck server
+        run: npx tsc --noEmit
+
+      - name: Typecheck packages
+        run: |
+          npx tsc -p packages/types/tsconfig.json --noEmit
+          npx tsc -p packages/node/tsconfig.json --noEmit
+          npx tsc -p packages/react/tsconfig.json --noEmit
+          npx tsc -p packages/cli/tsconfig.json --noEmit
+
+      - name: Build packages
+        # signing.contract.spec.ts requires() the compiled SDK, so this must
+        # run before jest on a fresh checkout.
+        run: npm run build:packages
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test -- --ci
+
+      - name: Build server
+        run: npm run build
+
+      # Confirms the Dockerfile still produces a runnable image. A broken
+      # Dockerfile that only surfaces at deploy time is a bad trade.
+      - name: Build image
+        run: docker build -t payforge:ci .
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: payforge:ci
