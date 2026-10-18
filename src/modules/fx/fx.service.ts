@@ -33,12 +33,38 @@ export class FxService implements OnModuleInit {
     }
   }
 
-  @Cron('7 0 * * *', { timeZone: 'UTC' })
+  /**
+ * Refresh exchange rates.
+ *
+ * Runs four times a day rather than once. A single failure at 00:07 UTC
+ * previously meant the next attempt was +24h, so one transient error cost a
+ * full day of quoting against a stale rate — and since the fallback path had
+ * no age bound, nothing surfaced the problem.
+ *
+ * `ensureToday` also runs on a short interval so a long-running process that
+ * started before the daily window still converges.
+ */
+@Cron('7 0,6,12,18 * * *', { timeZone: 'UTC' })
   async refreshDaily() {
     try {
       await this.fetchAndStore();
     } catch (error) {
       this.log.error({ err: error }, 'scheduled exchange rate refresh failed');
+    }
+  }
+
+  /**
+   * Backstop for the scheduled refresh.
+   *
+   * Cheap: one indexed primary-key lookup, and it only fetches when today's
+   * snapshot is genuinely missing.
+   */
+  @Cron('23 */2 * * *', { timeZone: 'UTC' })
+  async refreshIfStale() {
+    try {
+      await this.ensureToday();
+    } catch (error) {
+      this.log.error({ err: error }, 'exchange rate backstop refresh failed');
     }
   }
 
@@ -62,18 +88,51 @@ export class FxService implements OnModuleInit {
       if (!previous) {
         throw ApiError.of(ErrorCode.EXCHANGE_RATES_UNAVAILABLE);
       }
+
+      // The age check must apply HERE, not only on the branch below.
+      //
+      // The primary branch fetched `row` by today's date, so ageDays was always
+      // ~0 and MAX_SNAPSHOT_AGE_DAYS was unreachable — it could only fire under
+      // clock skew. The fallback branch is the only path where a rate can
+      // actually be old, and it had no bound at all: a provider outage lasting
+      // a week meant PayForge quoted and settled every cross-currency payment
+      // at a week-old rate, silently.
+      this.assertFresh(previous.rateDate, previous.rates);
+
       return { rateDate: previous.rateDate, rates: previous.rates as Record<string, number> };
     }
 
-    const ageDays = (Date.now() - row.rateDate.getTime()) / (24 * 60 * 60 * 1000);
+    this.assertFresh(row.rateDate, row.rates);
+
+    return { rateDate: row.rateDate, rates: row.rates as Record<string, number> };
+  }
+
+  /**
+   * Refuse to quote against a rate outside the permitted window.
+   *
+   * Settling at a stale rate silently misprices every cross-currency payment,
+   * which is worse than refusing to quote: the merchant cannot see the damage
+   * until a payout lands short.
+   */
+  private assertFresh(rateDate: Date, rates: unknown): void {
+    const ageDays = (Date.now() - rateDate.getTime()) / (24 * 60 * 60 * 1000);
     if (ageDays > MAX_SNAPSHOT_AGE_DAYS) {
       throw ApiError.of(
         ErrorCode.EXCHANGE_RATES_UNAVAILABLE,
         'The available exchange rate is too old to quote against. Please retry shortly.',
+        { meta: { rateDate: rateDate.toISOString().slice(0, 10), ageDays: Math.floor(ageDays) } },
       );
     }
 
-    return { rateDate: row.rateDate, rates: row.rates as Record<string, number> };
+    // A snapshot that parsed but contains no usable pair is as useless as a
+    // missing one, and would otherwise fail much later inside quoteSettlement.
+    const pairs = rates && typeof rates === 'object' ? Object.keys(rates) : [];
+    if (pairs.length === 0) {
+      throw ApiError.of(
+        ErrorCode.EXCHANGE_RATES_UNAVAILABLE,
+        'The available exchange rate snapshot is empty.',
+      );
+    }
   }
 
   /** Exposed so merchants can pre-quote before creating a payment. */

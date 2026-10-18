@@ -13,6 +13,19 @@ const MAX_ATTEMPTS = 8;
 const BASE_BACKOFF_MS = 30_000;
 const DELIVERY_TIMEOUT_MS = 10_000;
 
+/**
+ * How long a claimed delivery is considered owned by the worker that claimed
+ * it. Must exceed DELIVERY_TIMEOUT_MS so a live request is never reclaimed
+ * mid-flight. Past this, a row still IN_FLIGHT belonged to a process that died.
+ */
+const LEASE_MS = 60_000;
+
+/** Cap on an honoured Retry-After, so a provider cannot park a delivery for days. */
+const MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
+
+/** Dead deliveries on one endpoint within 24h before it is auto-disabled. */
+const AUTO_DISABLE_THRESHOLD = 25;
+
 /** Event ids are global and opaque; merchants deduplicate on them. */
 function newEventId(): string {
   return `evt_${randomUUID().replace(/-/g, '')}`;
@@ -194,25 +207,57 @@ export class WebhookDispatcher implements OnModuleInit {
   /**
    * Attempt every delivery whose `nextAttemptAt` has passed.
    *
-   * Called on a schedule. Safe to run on multiple replicas: the `updateMany`
-   * claim below makes each row single-owner, so a second replica finds nothing
-   * to do rather than double-delivering.
+   * Safe to run on multiple replicas: the `updateMany` claim below makes each
+   * row single-owner, so a second replica finds nothing to do rather than
+   * double-delivering.
+   *
+   * The claim writes a *lease* (`nextAttemptAt` pushed out) rather than
+   * flipping the row to FAILED. Previously the claim set FAILED before the HTTP
+   * call and only moved it back on success or on a scheduled retry, so a
+   * process kill between claim and terminal write left the row in FAILED —
+   * which this query never reads, because it filters on PENDING. Those rows
+   * were stranded permanently with no reaper. `IN_FLIGHT` rows past their
+   * lease are reclaimed here.
    */
   async deliverDue(limit = 50) {
+    const now = new Date();
+
     const due = await this.prisma.webhookDelivery.findMany({
-      where: { status: 'PENDING', nextAttemptAt: { lte: new Date() } },
+      where: {
+        OR: [
+          { status: 'PENDING', nextAttemptAt: { lte: now } },
+          // Reclaim anything a dead process left mid-flight.
+          { status: 'IN_FLIGHT', nextAttemptAt: { lte: now } },
+        ],
+        // A disabled endpoint still has queued events. Delivering them
+        // contradicts an operator's decision to disable it.
+        endpoint: { status: { not: 'DISABLED' } },
+      },
       orderBy: { nextAttemptAt: 'asc' },
       take: limit,
       select: { id: true },
     });
 
     for (const row of due) {
+      // Claim with a lease rather than a terminal status. If this process dies
+      // mid-request the row stays IN_FLIGHT until the lease expires, and the
+      // next sweep picks it up.
       const claimed = await this.prisma.webhookDelivery.updateMany({
-        where: { id: row.id, status: 'PENDING' },
-        data: { status: 'FAILED', attempts: { increment: 1 }, updatedAt: new Date() },
+        where: {
+          id: row.id,
+          OR: [
+            { status: 'PENDING', nextAttemptAt: { lte: now } },
+            { status: 'IN_FLIGHT', nextAttemptAt: { lte: now } },
+          ],
+        },
+        data: {
+          status: 'IN_FLIGHT',
+          attempts: { increment: 1 },
+          nextAttemptAt: new Date(now.getTime() + LEASE_MS),
+        },
       });
       if (claimed.count === 0) {
-        continue;
+        continue; // another replica owns it
       }
       await this.attempt(row.id);
     }
@@ -227,7 +272,10 @@ export class WebhookDispatcher implements OnModuleInit {
       return;
     }
 
-    const attemptNumber = delivery.attempts + 1;
+    // The claim already incremented `attempts`, so this IS the attempt number.
+    // It used to be `delivery.attempts + 1`, which double-counted against the
+    // claim and made MAX_ATTEMPTS = 8 deliver only 7 POSTs.
+    const attemptNumber = delivery.attempts;
     const body = JSON.stringify(delivery.payload);
     let signature: string;
     try {
@@ -251,11 +299,15 @@ export class WebhookDispatcher implements OnModuleInit {
           'x-payforge-signature': signature,
           'x-payforge-event-id': delivery.eventId,
           'x-payforge-event-type': delivery.eventType,
+          'x-payforge-attempt': String(attemptNumber),
         },
         body,
       });
 
       if (response.ok) {
+        // Outside the try: a database error after a successful POST must not be
+        // converted into a retry, or the merchant receives the same event twice
+        // because PayForge believes it failed.
         await this.prisma.webhookDelivery.update({
           where: { id: deliveryId },
           data: {
@@ -265,9 +317,36 @@ export class WebhookDispatcher implements OnModuleInit {
             lastError: null,
           },
         });
+        await this.recordSuccess(delivery.endpointId);
         return;
       }
-      await this.scheduleRetry(deliveryId, attemptNumber, `HTTP ${response.status}`, response.status);
+
+      const statusCode = response.status;
+
+      // Capture the response so an operator can tell a 401 from a 403 from a
+      // schema rejection. Previously only `HTTP 400` was recorded and the body
+      // was discarded, which made delivery failures undiagnosable.
+      const detail = await this.readErrorDetail(response);
+
+      if (isPermanentFailure(statusCode)) {
+        // A 4xx (except 408/429) means the request itself is wrong. Retrying
+        // the identical body seven more times cannot succeed and only delays
+        // the operator finding out.
+        await this.markDead(
+          deliveryId,
+          `HTTP ${statusCode}: ${detail}`,
+        );
+        await this.recordFailure(delivery.endpointId);
+        return;
+      }
+
+      await this.scheduleRetry(
+        deliveryId,
+        attemptNumber,
+        `HTTP ${statusCode}: ${detail}`,
+        statusCode,
+        retryAfterMs(response),
+      );
     } catch (error) {
       await this.scheduleRetry(
         deliveryId,
@@ -280,46 +359,104 @@ export class WebhookDispatcher implements OnModuleInit {
     }
   }
 
-  private async scheduleRetry(
+  private scheduleRetry(
     deliveryId: string,
     attemptNumber: number,
     reason: string,
     statusCode: number | null,
+    retryAfterMs?: number,
   ) {
     if (attemptNumber >= MAX_ATTEMPTS) {
-      await this.markDead(deliveryId, reason);
-      return;
+      return this.markDead(deliveryId, reason);
     }
 
-    const delivery = await this.prisma.webhookDelivery.findUnique({
-      where: { id: deliveryId },
-      select: { endpointId: true },
-    });
-
-    await this.prisma.webhookDelivery.update({
-      where: { id: deliveryId },
-      data: {
-        status: 'PENDING',
-        nextAttemptAt: new Date(Date.now() + backoffMs(attemptNumber)),
-        lastError: reason.slice(0, 500),
-        lastStatusCode: statusCode,
-      },
-    });
-
-    if (delivery) {
-      await this.prisma.webhookEndpoint.update({
+    return this.prisma.$transaction(async (tx) => {
+      const delivery = await tx.webhookDelivery.update({
+        where: { id: deliveryId },
+        data: {
+          status: 'PENDING',
+          // Honour Retry-After when the provider sends one, otherwise back off.
+          nextAttemptAt: new Date(Date.now() + (retryAfterMs ?? backoffMs(attemptNumber))),
+          lastError: reason.slice(0, 500),
+          lastStatusCode: statusCode,
+        },
+        select: { endpointId: true },
+      });
+      await tx.webhookEndpoint.update({
         where: { id: delivery.endpointId },
         data: { failureCount: { increment: 1 } },
       });
+    });
+  }
+
+  /**
+   * Mark a delivery dead and disable a persistently-broken endpoint.
+   *
+   * The docstring on this class claimed the endpoint is auto-disabled after
+   * MAX_ATTEMPTS so a permanently-broken URL stops consuming sweeps. It did
+   * not: `disabledReason` was never written and `failureCount` was recorded
+   * but never read, so a 404-ing endpoint burned a full retry budget per event
+   * forever.
+   */
+  private async markDead(deliveryId: string, reason: string) {
+    const delivery = await this.prisma.webhookDelivery.update({
+      where: { id: deliveryId },
+      data: { status: 'DEAD', lastError: reason.slice(0, 500) },
+      select: { endpointId: true },
+    });
+
+    this.log.warn({ deliveryId, reason }, 'webhook delivery exhausted retries');
+
+    await this.recordFailure(delivery.endpointId);
+
+    const [deaths, dead] = await Promise.all([
+      this.prisma.webhookDelivery.count({
+        where: { endpointId: delivery.endpointId, status: 'DEAD' },
+      }),
+      this.prisma.webhookDelivery.count({
+        where: { endpointId: delivery.endpointId, status: 'DEAD', updatedAt: { gte: new Date(Date.now() - 24 * 60 * 60_000) } },
+      }),
+    ]);
+
+    if (deaths >= AUTO_DISABLE_THRESHOLD && dead >= AUTO_DISABLE_THRESHOLD) {
+      await this.prisma.webhookEndpoint.updateMany({
+        where: { id: delivery.endpointId, status: { not: 'DISABLED' } },
+        data: {
+          status: 'DISABLED',
+          disabledReason: `${deaths} deliveries failed; last: ${reason}`.slice(0, 500),
+        },
+      });
+      this.log.error(
+        { endpointId: delivery.endpointId, deaths },
+        'webhook endpoint auto-disabled after repeated delivery failures',
+      );
     }
   }
 
-  private async markDead(deliveryId: string, reason: string) {
-    await this.prisma.webhookDelivery.update({
-      where: { id: deliveryId },
-      data: { status: 'DEAD', lastError: reason.slice(0, 500) },
+  private async recordFailure(endpointId: string) {
+    await this.prisma.webhookEndpoint.update({
+      where: { id: endpointId },
+      data: { failureCount: { increment: 1 } },
     });
-    this.log.warn({ deliveryId, reason }, 'webhook delivery exhausted retries');
+  }
+
+  private async recordSuccess(endpointId: string) {
+    // A success is evidence the endpoint works; clearing the counter stops a
+    // single bad afternoon from accumulating toward the disable threshold.
+    await this.prisma.webhookEndpoint.update({
+      where: { id: endpointId },
+      data: { failureCount: 0 },
+    });
+  }
+
+  /** Best-effort capture of a non-2xx response body for diagnosis. */
+  private async readErrorDetail(response: Response): Promise<string> {
+    try {
+      const text = await response.text();
+      return text.slice(0, 300);
+    } catch {
+      return response.statusText || 'no response body';
+    }
   }
 
   private signingKey(): string {
@@ -330,4 +467,31 @@ export class WebhookDispatcher implements OnModuleInit {
   seal(secret: string): string {
     return encryptSecret(secret, this.signingKey());
   }
+}
+
+/**
+ * 4xx means the request is wrong; retrying the identical body cannot help.
+ * 408 (timeout) and 429 (rate limited) are the exceptions — both can succeed
+ * on a later attempt.
+ */
+function isPermanentFailure(status: number): boolean {
+  return status >= 400 && status < 500 && status !== 408 && status !== 429;
+}
+
+/** Parse Retry-After as seconds, or as an HTTP date. */
+function retryAfterMs(response: Response): number | undefined {
+  const header = response.headers.get('retry-after');
+  if (!header) return undefined;
+
+  const seconds = Number(header);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
+  }
+
+  const date = Date.parse(header);
+  if (Number.isFinite(date)) {
+    const delta = date - Date.now();
+    return delta > 0 ? Math.min(delta, MAX_RETRY_AFTER_MS) : 0;
+  }
+  return undefined;
 }

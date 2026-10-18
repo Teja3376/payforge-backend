@@ -794,4 +794,8 @@ enum DeliveryStatus {
   DELIVERED
   FAILED
   DEAD
+  /// Claimed by a worker and currently being delivered. Carries a lease in
+  /// `nextAttemptAt`, so a delivery stranded by a process crash is reclaimed
+  /// rather than lost.
+  IN_FLIGHT
 }
