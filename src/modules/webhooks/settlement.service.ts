@@ -1,10 +1,11 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import {
   ActorType,
   LedgerAccount,
   LedgerType,
   PaymentStatus,
   Prisma,
+  Refund,
   ResolutionAction,
   ResolutionSubject,
   TransactionStatus,
@@ -14,6 +15,7 @@ import { generatePublicId, withPublicId } from '../../common/utils/generate-publ
 import { ApiError, ErrorCode } from '../../common/errors/api-error';
 import { logger } from '../../common/logger/logger';
 import { PrismaService } from '../../database/prisma.service';
+import { BANK_PORT, type BankPort } from '../bank/bank.port';
 import { WebhookBody } from '../bank/webhook-signature';
 import { presentTransaction, transactionInclude } from '../transactions/transaction.presenter';
 import { WebhookDispatcher } from './webhook-dispatcher.service';
@@ -25,6 +27,7 @@ export class SettlementService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly webhooks: WebhookDispatcher,
+    @Inject(BANK_PORT) private readonly bank: BankPort,
   ) {}
 
   /**
@@ -216,12 +219,9 @@ export class SettlementService {
       include: transactionInclude,
     });
 
-    if (outcome === 'applied') {
-      await this.webhooks.dispatchPaymentEvent({
-        paymentId: existing.paymentId,
-        type: succeeded ? 'PAYMENT_SUCCEEDED' : 'PAYMENT_FAILED',
-      });
-    }
+    // No dispatch here: the event is enqueued inside the transaction above so
+    // a failure rolls the settlement back instead of silently losing the
+    // notification. Dispatching again post-commit would deliver it twice.
 
     return { replayed: outcome === 'replay', transaction: presentTransaction(fresh) };
   }
@@ -289,6 +289,59 @@ export class SettlementService {
 
     const nowPaid = nowRefundedAfter(requested, remaining, alreadyRefunded, payment.settlementAmount);
 
+    // ---- Phase 1: reserve the idempotency key -------------------------
+    //
+    // Committed on its own so the reservation survives the provider call
+    // below. This also supplies the read-side idempotency the refund path
+    // never had: a retry with the same key returns the original refund
+    // instead of falling through to the unique-violation rollback and a 409.
+    const reserved = await this.reserveRefund({
+      payment,
+      transactionId: transaction.id,
+      input,
+      requested,
+      feeReversed,
+      netReversed,
+      currency: transaction.currency,
+    });
+    if (reserved.replayed) {
+      return reserved.refund;
+    }
+    const refundRow = reserved.refund;
+
+    // ---- Phase 2: move the money at the provider ----------------------
+    //
+    // Irreversible. The reservation above means a crash here leaves a PENDING
+    // row that reconciliation can resolve, rather than an unrecorded refund.
+    let gatewayRefundRef: string;
+    try {
+      const result = await this.bank.refund({
+        gatewayRef: transaction.gatewayRef,
+        amountMinor: requested,
+        currency: transaction.currency,
+        // Namespaced by payment so two merchants reusing a generic
+        // idempotency key cannot collide at the provider, which would
+        // silently suppress one of the refunds.
+        idempotencyKey: `refund:${payment.id}:${input.idempotencyKey}`,
+      });
+      gatewayRefundRef = result.refundRef;
+    } catch (error) {
+      this.log.error(
+        { err: error, paymentId: payment.publicId, amount: requested.toString() },
+        'provider refund failed',
+      );
+      await this.prisma.refund.update({
+        where: { id: refundRow.id },
+        data: { status: 'FAILED', failureReason: 'Bank rejected the refund' },
+      });
+      throw ApiError.of(
+        ErrorCode.BANK_CHARGE_FAILED,
+        'The bank declined this refund. No money has been returned.',
+        { cause: error },
+      );
+    }
+
+    // ---- Phase 3: post the ledger reversal ----------------------------
     const refund = await this.prisma.$transaction(
       async (tx) => {
         const claimed = await tx.payments.updateMany({
@@ -305,46 +358,35 @@ export class SettlementService {
           },
         });
         if (claimed.count === 0) {
+          // The provider has already refunded. The ledger still has to follow,
+          // otherwise reconciliation will find an unreversed merchant debit.
+          this.log.error(
+            { paymentId: payment.publicId, refundId: refundRow.publicId },
+            'provider refunded but the payment changed underneath — manual reconciliation required',
+          );
           throw ApiError.of(
             ErrorCode.ALREADY_IN_STATE,
             'This payment changed while the refund was being applied. Please retry.',
           );
         }
 
-        // The ledger reference must be unique per refund, not per amount. Two
-      // partial refunds of the same value on one transaction previously
-      // produced an identical referenceId, colliding on the
-      // [account, accountKey, referenceId, type] unique index and rolling
-      // back the second refund entirely.
-      await this.pull(tx, {
-        merchantId: payment.merchantId,
-        currency: transaction.currency,
-        referenceId: `refund:${input.idempotencyKey}:${payment.id}`,
-        fee: feeReversed,
-        net: netReversed,
-      });
+        // The ledger reference is unique per refund, not per amount. Two
+        // partial refunds of the same value on one transaction previously
+        // produced an identical referenceId, colliding on the
+        // [account, accountKey, referenceId, type] unique index and rolling
+        // back the second refund entirely.
+        await this.pull(tx, {
+          merchantId: payment.merchantId,
+          currency: transaction.currency,
+          referenceId: `refund:${refundRow.publicId}`,
+          fee: feeReversed,
+          net: netReversed,
+        });
 
-        const created = await withPublicId(
-          'pf-ref',
-          (publicId) =>
-            tx.refund.create({
-              data: {
-                publicId,
-                paymentId: payment.id,
-                transactionId: transaction.id,
-                merchantId: payment.merchantId,
-                amount: requested,
-                currency: transaction.currency,
-                feeReversed,
-                netReversed,
-                reason: input.reason,
-                status: 'SUCCEEDED',
-                idempotencyKey: input.idempotencyKey,
-                createdById: input.actorId,
-              },
-            }),
-          isUniqueViolation,
-        );
+        const updated = await tx.refund.update({
+          where: { id: refundRow.id },
+          data: { status: 'SUCCEEDED', gatewayRefundRef },
+        });
 
         await tx.resolution.create({
           data: {
@@ -355,7 +397,8 @@ export class SettlementService {
             subjectType: ResolutionSubject.PAYMENT,
             subjectPublicId: input.paymentPublicId,
             metadata: {
-              refundId: created.publicId,
+              refundId: updated.publicId,
+              gatewayRefundRef,
               amount: requested.toString(),
               currency: transaction.currency,
               ...(input.reason ? { reason: input.reason } : {}),
@@ -363,7 +406,7 @@ export class SettlementService {
           },
         });
 
-        return created;
+        return updated;
       },
       { maxWait: 10000, timeout: 20000 },
     );
@@ -374,6 +417,91 @@ export class SettlementService {
     });
 
     return refund;
+  }
+
+  /**
+   * Reserve a refund's idempotency key before the provider is contacted.
+   *
+   * Committed on its own so the reservation outlives the bank call. On a
+   * duplicate key the existing refund is returned rather than raising, which is
+   * what makes a retry of a successful refund return the original result
+   * instead of a 409 from the unique-violation rollback.
+   */
+  private async reserveRefund(input: {
+    payment: { id: string; publicId: string; merchantId: string };
+    transactionId: string;
+    input: {
+      paymentPublicId: string;
+      reason?: string;
+      idempotencyKey: string;
+      actorId: string;
+      actorType: ActorType;
+    };
+    requested: bigint;
+    feeReversed: bigint;
+    netReversed: bigint;
+    currency: string;
+  }): Promise<{ replayed: boolean; refund: Refund }> {
+    const existing = await this.prisma.refund.findUnique({
+      where: {
+        merchantId_idempotencyKey: {
+          merchantId: input.payment.merchantId,
+          idempotencyKey: input.input.idempotencyKey,
+        },
+      },
+    });
+    if (existing) {
+      // A different amount under a reused key is a client bug, not a retry.
+      if (existing.amount !== input.requested) {
+        throw ApiError.of(
+          ErrorCode.IDEMPOTENCY_PAYLOAD_MISMATCH,
+          'That idempotency key was already used for a refund of a different amount.',
+        );
+      }
+      return { replayed: true, refund: existing };
+    }
+
+    try {
+      const created = await withPublicId(
+        'pf-ref',
+        (publicId) =>
+          this.prisma.refund.create({
+            data: {
+              publicId,
+              paymentId: input.payment.id,
+              transactionId: input.transactionId,
+              merchantId: input.payment.merchantId,
+              amount: input.requested,
+              currency: input.currency,
+              feeReversed: input.feeReversed,
+              netReversed: input.netReversed,
+              reason: input.input.reason,
+              status: 'PENDING',
+              idempotencyKey: input.input.idempotencyKey,
+              createdById: input.input.actorId,
+            },
+          }),
+        isUniqueViolation,
+      );
+      return { replayed: false, refund: created };
+    } catch (error) {
+      // Lost the race against a concurrent request with the same key. The
+      // winner owns the refund; return theirs rather than failing the caller.
+      if (isUniqueViolation(error)) {
+        const raced = await this.prisma.refund.findUnique({
+          where: {
+            merchantId_idempotencyKey: {
+              merchantId: input.payment.merchantId,
+              idempotencyKey: input.input.idempotencyKey,
+            },
+          },
+        });
+        if (raced) {
+          return { replayed: true, refund: raced };
+        }
+      }
+      throw error;
+    }
   }
 
   /**

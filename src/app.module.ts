@@ -19,6 +19,7 @@ import { HealthModule } from './modules/health/health.module';
 import { MerchantModule } from './modules/merchants/merchant.module';
 import { PaymentModule } from './modules/payments/payment.module';
 import { PayoutModule } from './modules/payouts/payout.module';
+import { ReconciliationModule } from './modules/reconciliation/reconciliation.module';
 import { RefundModule } from './modules/refunds/refund.module';
 import { TransactionModule } from './modules/transactions/transaction.module';
 import { WebhooksModule } from './modules/webhooks/webhook.module';
@@ -57,6 +58,7 @@ const devModules = process.env.ENABLE_DEV_TOOLS === 'true' ? [DevModule] : [];
     ApiKeyModule,
     PayoutModule,
     RefundModule,
+    ReconciliationModule,
     HealthModule,
     ...devModules,
   ],

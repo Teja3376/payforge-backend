@@ -1,5 +1,6 @@
 import { Logger, Module } from '@nestjs/common';
 import { ScheduleModule } from '@nestjs/schedule';
+import { BankModule } from '../bank/bank.module';
 import { WebhookController } from './webhook.controller';
 import { WebhookEndpointService } from './webhook-endpoint.service';
 import { WebhookDispatcher } from './webhook-dispatcher.service';
@@ -17,7 +18,10 @@ import { SettlementService } from './settlement.service';
   // Plain ScheduleModule, not forRoot(). AppModule already calls forRoot();
   // calling it again re-registers the explorer and SchedulerRegistry.addCronJob
   // throws DUPLICATE_SCHEDULER on the second registration of any cron.
-  imports: [ScheduleModule],
+  // BankModule supplies BANK_PORT for SettlementService, which now calls
+  // BankPort.refund. Previously refunds moved only the internal ledger, so the
+  // cardholder was never actually credited back and the merchant absorbed it.
+  imports: [ScheduleModule, BankModule],
   controllers: [WebhookController],
   providers: [
     WebhookDispatcher,

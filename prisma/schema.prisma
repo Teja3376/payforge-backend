@@ -307,7 +307,16 @@ model Refund {
   feeReversed    BigInt       @default(0)
   netReversed    BigInt       @default(0)
   reason         String?
-  status         RefundStatus @default(SUCCEEDED)
+  /// PENDING is reserved before the provider is called, because a bank refund
+  /// is irreversible: once the money has gone back to the cardholder there is
+  /// nothing to compensate with. A row still PENDING when the sweeper runs is
+  /// either in flight or was stranded by a crash, and is resolved by
+  /// ReconciliationService against the provider.
+  status         RefundStatus @default(PENDING)
+  /// The provider's refund reference. Recorded so a stranded PENDING refund can
+  /// be resolved by querying the bank rather than re-sending the money.
+  gatewayRefundRef String?
+  failureReason  String?
   idempotencyKey String
   createdById    String
   createdAt      DateTime     @default(now())
@@ -319,6 +328,7 @@ model Refund {
   @@unique([merchantId, idempotencyKey])
   @@index([paymentId, createdAt])
   @@index([merchantId, createdAt])
+  @@index([status, createdAt])
 }
 
 model PayoutDestination {

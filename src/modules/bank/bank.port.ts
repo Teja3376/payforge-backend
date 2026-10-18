@@ -76,6 +76,27 @@ createPayout(input: {
     clientSecret: string;
     expiresAt: Date;
   }): Promise<{ sessionId: string }>;
+
+  /**
+   * The authoritative state of a charge, as the provider sees it.
+   *
+   * Reconciliation needs this: when a callback is lost, the local row stays
+   * PENDING forever and `Transactions_one_open_per_payment` blocks any further
+   * charge on that payment. The only way to resolve that is to ask the
+   * provider what actually happened.
+   *
+   * Must return UNKNOWN rather than guessing when the reference is not
+   * recognised: reconciliation acts on this answer.
+   */
+  getChargeStatus(input: { gatewayRef: string }): Promise<{
+    status: 'PENDING' | 'SUCCESS' | 'FAILED' | 'VOIDED' | 'UNKNOWN';
+    settledAt?: Date;
+  }>;
+
+  /** The authoritative state of a refund. */
+  getRefundStatus(input: { gatewayRef: string; refundRef?: string }): Promise<{
+    status: 'PENDING' | 'SUCCEEDED' | 'FAILED' | 'UNKNOWN';
+  }>;
 }
 
 export const BANK_PORT = Symbol('BANK_PORT');

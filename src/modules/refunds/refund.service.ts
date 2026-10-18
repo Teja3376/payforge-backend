@@ -128,6 +128,8 @@ export class RefundService {
       feeReversed: toMajorNumber(refund.feeReversed, refund.currency),
       netReversed: toMajorNumber(refund.netReversed, refund.currency),
       status: refund.status,
+      gatewayRefundRef: refund.gatewayRefundRef,
+      failureReason: refund.failureReason,
       reason: refund.reason,
       createdAt: refund.createdAt,
     };

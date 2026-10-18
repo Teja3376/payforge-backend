@@ -20,6 +20,20 @@ export class MockBankAdapter implements BankPort {
   /** Simulated latency, used to prove the gateway timeout path. */
   chargeDelayMs = 0;
 
+  /**
+   * Charge and refund outcomes, so `getChargeStatus` and `getRefundStatus` can
+   * answer truthfully for references this adapter actually issued. A lookup for
+   * anything else returns UNKNOWN rather than a fabricated answer.
+   */
+  private readonly charges = new Map<string, 'PENDING' | 'SUCCESS' | 'FAILED' | 'VOIDED'>();
+  private readonly refunds = new Map<string, 'PENDING' | 'SUCCEEDED' | 'FAILED'>();
+  private readonly refundsByCharge = new Set<string>();
+
+  /** Test/dev hook: record how a charge should resolve. */
+  setChargeOutcome(gatewayRef: string, status: 'PENDING' | 'SUCCESS' | 'FAILED' | 'VOIDED') {
+    this.charges.set(gatewayRef, status);
+  }
+
   async createCharge(input: {
     amountMinor: bigint;
     currency: string;
@@ -37,24 +51,30 @@ export class MockBankAdapter implements BankPort {
     if (input.amountMinor <= 0n) {
       throw new Error('Mock bank refused a non-positive amount');
     }
-    return { gatewayRef: `mock_${randomUUID().replace(/-/g, '')}` };
+    const gatewayRef = `mock_${randomUUID().replace(/-/g, '')}`;
+    this.charges.set(gatewayRef, 'PENDING');
+    return { gatewayRef };
   }
 
   // eslint-disable-next-line @typescript-eslint/require-await
   async voidCharge(input: { gatewayRef: string; reason: string }) {
     void input;
     this.logger.log('Voided mock charge');
+    this.charges.set(input.gatewayRef, 'VOIDED');
     return { voided: true };
   }
 
   // eslint-disable-next-line @typescript-eslint/require-await
-  async refund(_input: {
+  async refund(input: {
     gatewayRef: string;
     amountMinor: bigint;
     currency: string;
     idempotencyKey: string;
   }) {
-    return { refundRef: `mock_refr_${randomUUID().replace(/-/g, '')}` };
+    const refundRef = `mock_refr_${randomUUID().replace(/-/g, '')}`;
+    this.refunds.set(refundRef, 'SUCCEEDED');
+    this.refundsByCharge.add(input.gatewayRef);
+    return { refundRef };
   }
 
   // eslint-disable-next-line @typescript-eslint/require-await
@@ -76,5 +96,32 @@ export class MockBankAdapter implements BankPort {
   async createTokenizationSession(input: { clientSecret: string; expiresAt: Date }) {
     void input;
     return { sessionId: `mock_ts_${randomUUID().replace(/-/g, '')}` };
+  }
+
+  /**
+   * In-memory charge status.
+   *
+   * The mock records nothing, so a query for an unknown reference reports
+   * UNKNOWN rather than guessing. That is deliberate: an adapter that reported
+   * a confident answer for a charge it had never seen would let reconciliation
+   * "resolve" a stranded transaction into a confidently wrong state.
+   */
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async getChargeStatus(input: { gatewayRef: string }) {
+    if (!this.charges.has(input.gatewayRef)) {
+      return { status: 'UNKNOWN' as const };
+    }
+    return { status: this.charges.get(input.gatewayRef)! };
+  }
+
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async getRefundStatus(input: { gatewayRef: string; refundRef?: string }) {
+    if (input.refundRef && !this.refunds.has(input.refundRef)) {
+      return { status: 'UNKNOWN' as const };
+    }
+    if (!input.refundRef && !this.refundsByCharge.has(input.gatewayRef)) {
+      return { status: 'UNKNOWN' as const };
+    }
+    return { status: 'SUCCEEDED' as const };
   }
 }
