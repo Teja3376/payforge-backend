@@ -43,11 +43,25 @@ export interface BankPort {
     idempotencyKey: string;
   }): Promise<{ refundRef: string }>;
 
-  /** Send money out to a merchant's bank account. */
-  createPayout(input: {
+  /**
+ * Send money out to a merchant's bank account.
+ *
+ * `destination` carries the routing details an adapter needs. PayForge stores
+ * account and routing numbers encrypted (`PayoutDestination.accountEnc` /
+ * `routingEnc`), so the executor decrypts at the point of transfer and never
+ * persists them in plaintext. An adapter that talks to a provider using
+ * connected-account IDs should map this to that identifier here rather than
+ * requiring the schema to change.
+ */
+createPayout(input: {
     amountMinor: bigint;
     currency: string;
-    destinationToken: string;
+    destination: {
+      bankName: string;
+      accountHolder: string;
+      accountNumber: string;
+      routingNumber: string;
+    };
     idempotencyKey: string;
   }): Promise<{ externalRef: string }>;
 

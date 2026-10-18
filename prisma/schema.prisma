@@ -461,7 +461,10 @@ model WebhookDelivery {
 model Resolution {
   id              String              @id @default(uuid())
   publicId        String              @unique
-  actorId         String
+  /// Nullable for SYSTEM actors: a scheduled job or an inbound provider
+  /// callback has no user behind it. The foreign key still applies whenever
+  /// actorType is USER or API_KEY.
+  actorId         String?
   actorType       ActorType           @default(USER)
   action          ResolutionAction
   subjectType     ResolutionSubject
@@ -469,7 +472,7 @@ model Resolution {
   metadata        Json?
   createdAt       DateTime            @default(now())
 
-  actor Users @relation(fields: [actorId], references: [id])
+  actor Users? @relation(fields: [actorId], references: [id])
 
   @@index([createdAt])
   @@index([actorId, createdAt])
@@ -599,6 +602,13 @@ enum LedgerType {
 enum LedgerAccount {
   MERCHANT
   PLATFORM
+  /// Counterparty for money leaving the platform: settles what the merchant
+  /// earns against a captured charge, and is debited by outbound payouts.
+  /// Without it every movement posts a single unpaired leg and the journal
+  /// cannot be shown to balance.
+  MERCHANT_CLEARING
+  /// Funds captured at the provider but not yet swept to a merchant balance.
+  PSP_CLEARING
 }
 
 enum ResolutionAction {
@@ -611,6 +621,15 @@ enum ResolutionAction {
   CREATE_API_KEY
   REVOKE_API_KEY
   PAYOUT_CREATED
+  /// A provider settled a charge whose payment had already been cancelled.
+  /// The funds were captured regardless, so the ledger is posted and the
+  /// payment is returned to SUCCESS for the merchant to see and refund if
+  /// they choose. Recorded so the event is auditable rather than a bare log.
+  SETTLE_CANCELLED_PAYMENT
+  KYC_APPROVED
+  KYC_REJECTED
+  /// Reconciliation found a discrepancy between the journal and balances.
+  RECONCILIATION_BREAK
 }
 
 enum ResolutionSubject {
@@ -667,6 +686,9 @@ enum WebhookEventType {
   PAYMENT_REFUNDED
   REFUND_SUCCEEDED
   REFUND_FAILED
+  /// A payout was accepted for scheduling. Distinct from PAYOUT_PAID: no
+  /// money has left the platform at this point.
+  PAYOUT_SCHEDULED
   PAYOUT_PAID
   PAYOUT_FAILED
 }

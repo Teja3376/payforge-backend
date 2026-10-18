@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { AccountStatus, PaymentStatus, Prisma, Role } from '@prisma/client';
+import { AccountStatus, PaymentStatus, Prisma, Role, TransactionStatus } from '@prisma/client';
 import type { RequestUser } from '../../common/auth/request-user';
 import { ApiError, ErrorCode } from '../../common/errors/api-error';
 import { assertIdempotencyKey, assertSamePayload, stableHash } from '../../common/idempotency/idempotency';
@@ -173,6 +173,25 @@ export class PaymentService {
     });
     if (!payment || !this.canSee(user, payment)) {
       throw ApiError.of(ErrorCode.PAYMENT_NOT_FOUND);
+    }
+
+    // A charge in flight must not be cancelable. `transaction.create` moves
+    // the payment to PENDING before the provider settles, so this guard is
+    // what stops a cancel racing a capture — which previously left the
+    // provider holding funds for a payment the merchant would never see as
+    // paid, with no ledger entry to reconcile against.
+    const openAttempt = await this.prisma.transactions.findFirst({
+      where: {
+        paymentId: payment.id,
+        status: { in: [TransactionStatus.PENDING, TransactionStatus.SUCCESS] },
+      },
+      select: { id: true, publicId: true },
+    });
+    if (openAttempt) {
+      throw ApiError.of(
+        ErrorCode.PAYMENT_FINALIZED,
+        'This payment has a charge in progress and can no longer be cancelled.',
+      );
     }
 
     const changed = await this.prisma.payments.updateMany({

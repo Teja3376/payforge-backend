@@ -135,7 +135,16 @@ curl -X POST localhost:3000/v1/api-keys \
 
 ## How to use it
 
-The fastest path is the npm SDK, which wraps the HTTP API.
+PayForge is an HTTP API at `/v1`. Your application keeps two credentials and uses each for a different job.
+
+| Credential | Who holds it | What it can do |
+|---|---|---|
+| Customer access token | The signed-in payer (`POST /v1/auth/login`) | Create a payment and attempt a charge |
+| Merchant API key (`pf_test_…` or `pf_live_…`) | Your server only | Refunds, payouts, saved payment methods, client sessions, webhook endpoints |
+
+Do not send both headers on one request. A browser never sees the API key: the browser talks to your app, and your app talks to PayForge.
+
+`@payforge/node` currently sends only `x-api-key`. Use it for the merchant routes. Create the payment and the charge with the customer's bearer token until those two routes accept a merchant key.
 
 ```bash
 npm install @payforge/node
@@ -158,36 +167,30 @@ There are **two objects**, and keeping them straight is the whole game:
 
 | Object | What it means | Who creates it |
 |---|---|---|
-| **Payment** | *An intent.* A quoted, frozen amount the customer intends to pay. | Your backend |
-| **Transaction** | *An attempt* to collect that payment with a specific method. | Your backend |
+| **Payment** | *An intent.* A quoted, frozen amount the customer intends to pay. | Your backend, with the **customer's** access token |
+| **Transaction** | *An attempt* to collect that payment with a specific method. | Your backend, with the **customer's** access token |
 
 One payment can have several transactions (customer tried card, it failed, tried
 UPI, succeeded) but **at most one open at a time**.
 
-```ts
-// 1. Create the payment. Freezes the FX quote and reserves the amount.
-const payment = await payforge.payments.create(
-  {
-    merchantPublicId: 'PF-MER-84JJVVGYTF3R',
-    amount: 1580,
-    currency: 'JPY',
-    description: 'Order #1001',
-    metadata: { orderId: '1001' },
-  },
-  { idempotencyKey: `order-1001` },   // ← required, always
-);
+```bash
+# 1. Create the payment with the customer's access token.
+#    Amounts on the wire are major units: 1580 JPY, or 950.75 INR.
+curl -X POST localhost:3000/v1/payments \
+  -H "authorization: Bearer $CUSTOMER_TOKEN" \
+  -H 'idempotency-key: order-1001' \
+  -H 'content-type: application/json' \
+  -d '{"merchantPublicId":"PF-MER-84JJVVGYTF3R","amount":1580,"currency":"JPY"}'
 
-// 2. Attempt the charge.
-const transaction = await payforge.transactions.create(
-  {
-    paymentPublicId: payment.publicId,
-    method: 'CARD',
-    savedPaymentMethodId: 'PF-PM-…',   // or inline card details
-  },
-  { idempotencyKey: `txn-1001` },
-);
+# 2. Attempt the charge with the same token. Prefer a saved method or a
+#    client session so the card number never hits your server.
+curl -X POST localhost:3000/v1/transactions \
+  -H "authorization: Bearer $CUSTOMER_TOKEN" \
+  -H 'idempotency-key: txn-1001' \
+  -H 'content-type: application/json' \
+  -d '{"paymentPublicId":"PF-PAY-…","method":"CARD","savedPaymentMethodId":"PF-PM-…"}'
 
-// 3. Wait for the webhook — do not poll.
+# 3. Wait for the signed webhook. Do not poll.
 ```
 
 **Always pass an `Idempotency-Key`.** Every money-moving endpoint requires one.
@@ -390,11 +393,9 @@ logs, so you can find the exact request.
 
 ## Core concepts
 
-### Money is never a float
+### Money is never a float in the database
 
-Every amount is an integer in **minor units** (`1580 JPY` → `1580`, `₹950.75` →
-`95075`). Floats never touch the database. Conversion happens once, at the
-edge, with explicit rounding.
+The JSON API speaks **major units** (`amount: 1580` for 1,580 JPY, `amount: 950.75` for ₹950.75). PayForge converts that to an integer minor-unit `BigInt` before it is stored (`1580` yen, `95075` paise). Floats never touch the database. Rounding is half-up, once, at that edge.
 
 Currencies with unusual exponents (JPY has none, KWD has three) are handled by a
 lookup table, not an `if` chain.
@@ -405,9 +406,7 @@ A payment stores `fxRateDate`, `usdRate`, `inrRate`, `settlementAmount` and
 `settlementCurrency` at the moment it is created. A transaction created an hour
 later still settles at that earlier quote.
 
-Settlement currency is chosen by the **merchant's** country and configuration —
-not the payer's. An Indian merchant settles in INR; everyone else settles in
-their own currency at the source rate.
+A charge is converted to INR only when the merchant's country is `IN`, their settlement currency is `INR`, and the customer paid in something else. Every other combination settles in the currency the customer paid.
 
 ### Fees are data, not code
 
@@ -511,8 +510,9 @@ npx payforge doctor    # check connectivity and list your key scopes
 npx payforge cards     # test card numbers (need a TEST-mode key)
 ```
 
-Test cards are rejected against live keys, so a test number cannot move real
-money even by mistake.
+Test card numbers are rejected only when the **merchant's** mode is `LIVE`.
+API-key mode does not control that check, and no route currently sets a
+merchant to `LIVE`. Approval sets the account to `ACTIVE` and leaves mode `TEST`.
 
 ---
 
@@ -521,7 +521,7 @@ money even by mistake.
 ```bash
 npm run start:dev      # watch mode
 npm run build          # compile
-npm test               # 144 unit tests
+npm test               # 148 unit tests
 npm run prisma:migrate # create + apply a migration (dev)
 npm run prisma:deploy  # apply migrations (prod)
 npm run prisma:reset   # drop + recreate
@@ -553,8 +553,10 @@ Worth knowing before you build on this:
   the bank; `BankPort.refund` exists but is unimplemented.
 - **The ledger is a two-sided revenue split**, not a fully balanced general
   ledger — there is no payer or suspense account.
-- **No scheduled payouts yet.** `POST /payouts` debits the balance and marks
-  the payout `SCHEDULED`; you drive the bank leg.
+- **No scheduled payouts yet.** `POST /payouts` debits the balance, leaves the row `SCHEDULED`, and still emits `PAYOUT_PAID`. The payout service does not call `BankPort.createPayout`.
+- **Approving a merchant is not the same as going live.** Status becomes `ACTIVE`. `mode` stays `TEST`. KYC can be submitted, and nothing in the API approves or rejects it. Payments do not wait for KYC.
+- **A merchant can set their own fee** from 0 to 10000 basis points. There is no admin review of that schedule.
+- **`@payforge/node` cannot create a payment or a charge.** Those routes require a customer access token, and the SDK sends only an API key.
 
 ---
 
@@ -578,9 +580,9 @@ scripts/e2e.sh   end-to-end smoke test
 - **Money invariants live in the database.** `CHECK (amount > 0)`,
   `balance >= 0`, `refundedAmount <= settlementAmount`. Application checks alone
   are one refactor away from being bypassed.
-- **The authorization guard fails closed.** An endpoint with neither `@Roles`
-  nor `@Scopes` is unreachable. The previous guard allowed access when no
-  metadata was present, so a forgotten decorator silently opened an endpoint.
+- **Role and scope checks run only when a route declares them.** A session
+  token skips `@Scopes`. An API key skips nothing that the route declared.
+  Logout and session routes are authenticated and have no role list.
 - **Scope checks apply to API keys only.** A session token is the bootstrap
   path — the operator issuing the first key cannot yet hold a key.
 - **Idempotency hashes are key-sorted.** `JSON.stringify` is order-dependent,

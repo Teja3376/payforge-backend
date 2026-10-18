@@ -87,10 +87,13 @@ export class KycSubmissionDto {
 export class FeeScheduleDto {
   @ApiProperty({
     example: 200,
-    description: 'Fee in basis points. 200 = 2.00%. Range 0–10000.',
+    description:
+      'Fee in basis points. 200 = 2.00%. Range 0–9900. ' +
+      'The ceiling is 9900 rather than 10000 because a 100% fee produces a ' +
+      'zero net amount, which the ledger cannot represent.',
   })
   @IsInt()
   @Min(0)
-  @Max(10000)
+  @Max(9900)
   basisPoints!: number;
 }

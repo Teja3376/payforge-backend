@@ -175,21 +175,77 @@ describe('payloadHash', () => {
 
 describe('splitProRata (partial refunds)', () => {
   it('splits proportionally', () => {
-    expect(splitProRata(200n, 9800n, 10_000n, 5_000n)).toEqual({ fee: 100n, net: 4_900n });
+    expect(splitProRata(200n, 10_000n, 5_000n, 0n)).toEqual({ fee: 100n, net: 4_900n });
   });
 
   it('returns the whole fee and net for a full refund', () => {
-    expect(splitProRata(200n, 9800n, 10_000n, 10_000n)).toEqual({ fee: 200n, net: 9_800n });
+    expect(splitProRata(200n, 10_000n, 10_000n, 0n)).toEqual({ fee: 200n, net: 9_800n });
   });
 
   it('keeps fee + net equal to the refunded part', () => {
     for (const part of [1n, 333n, 5_000n, 7_777n, 9_999n]) {
-      const { fee, net } = splitProRata(200n, 9800n, 10_000n, part);
+      const { fee, net } = splitProRata(200n, 10_000n, part, 0n);
       expect(fee + net).toBe(part);
     }
   });
 
   it('guards against a zero gross', () => {
-    expect(splitProRata(0n, 0n, 0n, 100n)).toEqual({ fee: 0n, net: 0n });
+    expect(splitProRata(0n, 0n, 100n, 0n)).toEqual({ fee: 0n, net: 0n });
+  });
+
+  /**
+   * The defect this guards against: dividing `totalFee * part / totalGross`
+   * independently per refund truncates, so N refunds summing to the gross
+   * reversed `totalFee - N`. The platform then retained the entire fee on a
+   * fully refunded payment, and the over-debit could exhaust the merchant
+   * balance and make the final refund unpayable.
+   */
+  it('reverses the exact original fee across N partial refunds', () => {
+    for (const [totalFee, totalGross] of [
+      [100n, 300n],
+      [1n, 3n],
+      [200n, 10_000n],
+      [7n, 7n],
+      [1n, 999n],
+      [3_333n, 100_000n],
+    ]) {
+      let feeReversed = 0n;
+      let netReversed = 0n;
+      let already = 0n;
+
+      // Refund in irregular thirds until the gross is exhausted.
+      const unit = totalGross / 3n;
+      for (let i = 0n; i < 3n; i += 1n) {
+        const part = i === 2n ? totalGross - already : unit;
+        const { fee, net } = splitProRata(totalFee, totalGross, part, already);
+        expect(fee + net).toBe(part);
+        feeReversed += fee;
+        netReversed += net;
+        already += part;
+      }
+
+      expect(already).toBe(totalGross);
+      expect(feeReversed).toBe(totalFee);
+      expect(netReversed).toBe(totalGross - totalFee);
+    }
+  });
+
+  it('never over-debits the merchant across many small refunds', () => {
+    const totalFee = 100n;
+    const totalGross = 300n;
+    let already = 0n;
+    let feeReversed = 0n;
+    let netReversed = 0n;
+
+    while (already < totalGross) {
+      const part = 100n;
+      const { fee, net } = splitProRata(totalFee, totalGross, part, already);
+      feeReversed += fee;
+      netReversed += net;
+      already += part;
+    }
+
+    expect(feeReversed).toBe(totalFee);
+    expect(netReversed).toBe(totalGross - totalFee);
   });
 });

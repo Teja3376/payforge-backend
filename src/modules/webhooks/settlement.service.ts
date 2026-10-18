@@ -105,13 +105,65 @@ export class SettlementService {
             data: { status: PaymentStatus.SUCCESS },
           });
           if (paid.count === 0) {
-            // Payment was refunded or cancelled underneath us. Record the
-            // settlement but do not credit the merchant again.
+            // The payment moved out from under us. This is reachable: the
+            // payer can cancel a PENDING payment while a charge is in flight,
+            // because `transaction.create` sets the payment to PENDING before
+            // the bank settles.
+            const current = await tx.payments.findUnique({
+              where: { id: existing.paymentId },
+              select: { status: true, merchantId: true, publicId: true },
+            });
+
+            if (
+              current?.status === PaymentStatus.REFUNDED ||
+              current?.status === PaymentStatus.PARTIALLY_REFUNDED
+            ) {
+              // Money already went back to the payer. Do not credit again.
+              this.log.error(
+                { paymentId: existing.paymentId, gatewayRef: body.gatewayRef },
+                'settled a transaction whose payment was already refunded',
+              );
+              return 'payment_not_payable';
+            }
+
+            // CANCELLED (or any other terminal state): the provider captured
+            // the funds regardless, so the ledger must reflect them. Leaving
+            // this unposted stranded real money at the bank with no merchant
+            // credit, no platform fee, and nothing to reconcile against.
             this.log.error(
               { paymentId: existing.paymentId, gatewayRef: body.gatewayRef },
-              'settled transaction whose payment is no longer payable',
+              'settled a charge on a cancelled payment — posting from captured funds',
             );
-            return 'payment_not_payable';
+
+            await this.post(tx, {
+              merchantId: existing.payment.merchantId,
+              currency: existing.currency,
+              referenceId: `settlement:${existing.publicId}`,
+              fee,
+              net,
+            });
+
+            // Move the payment to SUCCESS so the merchant sees real money and
+            // the refund path becomes available to them if they want it back.
+            await tx.payments.update({
+              where: { id: existing.paymentId },
+              data: { status: PaymentStatus.SUCCESS, cancelledReason: null },
+            });
+
+            await tx.resolution.create({
+              data: {
+                publicId: generatePublicId('pf-res'),
+                actorId: null,
+                actorType: 'SYSTEM',
+                action: ResolutionAction.SETTLE_CANCELLED_PAYMENT,
+                subjectType: ResolutionSubject.PAYMENT,
+                subjectPublicId: existing.payment.publicId,
+                metadata: {
+                  gatewayRef: body.gatewayRef,
+                  reason: 'charge captured after the payment was cancelled',
+                },
+              },
+            });
           }
         } else {
           await tx.payments.updateMany({
@@ -129,11 +181,26 @@ export class SettlementService {
             {
               merchantId: existing.payment.merchantId,
               currency: existing.currency,
-              referenceId: existing.publicId,
+              referenceId: `settlement:${existing.publicId}`,
               fee,
               net,
             },
           );
+
+          // Enqueue inside the transaction. Previously this ran after the
+          // commit, so a failure here returned 500 to the bank, the bank
+          // retried, and `settle()` hit the replay branch above — which
+          // returns { replayed: true } without re-dispatching. The merchant
+          // was never told the payment succeeded, and nothing logged it.
+          await this.webhooks.dispatchPaymentEvent({
+            paymentId: existing.paymentId,
+            type: 'PAYMENT_SUCCEEDED',
+          });
+        } else {
+          await this.webhooks.dispatchPaymentEvent({
+            paymentId: existing.paymentId,
+            type: 'PAYMENT_FAILED',
+          });
         }
         return 'applied';
       },
@@ -211,12 +278,13 @@ export class SettlementService {
       );
     }
 
-    // Pro-rata fee and net reversal, rounded so fee + net always equals amount.
+    // Pro-rata fee and net reversal, rounded so that partial refunds summing to
+    // the full gross reverse exactly the original fee and net.
     const { fee: feeReversed, net: netReversed } = splitProRata(
       transaction.fee,
-      transaction.netAmount,
       transaction.amount,
       requested,
+      alreadyRefunded,
     );
 
     const nowPaid = nowRefundedAfter(requested, remaining, alreadyRefunded, payment.settlementAmount);
@@ -243,13 +311,18 @@ export class SettlementService {
           );
         }
 
-        await this.pull(tx, {
-          merchantId: payment.merchantId,
-          currency: transaction.currency,
-          referenceId: `${transaction.publicId}:${requested.toString()}`,
-          fee: feeReversed,
-          net: netReversed,
-        });
+        // The ledger reference must be unique per refund, not per amount. Two
+      // partial refunds of the same value on one transaction previously
+      // produced an identical referenceId, colliding on the
+      // [account, accountKey, referenceId, type] unique index and rolling
+      // back the second refund entirely.
+      await this.pull(tx, {
+        merchantId: payment.merchantId,
+        currency: transaction.currency,
+        referenceId: `refund:${input.idempotencyKey}:${payment.id}`,
+        fee: feeReversed,
+        net: netReversed,
+      });
 
         const created = await withPublicId(
           'pf-ref',
@@ -303,14 +376,22 @@ export class SettlementService {
     return refund;
   }
 
-  /** Post a CREDIT pair: merchant net, platform fee. */
+  /**
+   * Post a settled charge.
+   *
+   * Three legs, balanced:
+   *   DEBIT  PSP_CLEARING   gross — funds captured from the payer
+   *   CREDIT MERCHANT       net   — the merchant's earning
+   *   CREDIT PLATFORM       fee   — the platform's cut
+   *
+   * The previous implementation wrote only the two CREDIT legs, which left
+   * sum(debits) = 0 system-wide and made the journal unauditable.
+   */
   private async post(
     tx: Prisma.TransactionClient,
     input: { merchantId: string; currency: string; referenceId: string; fee: bigint; net: bigint },
   ) {
     const balanceAfter = await applyBalance(tx, input.merchantId, input.currency, input.net, 'increment');
-    await applyPlatform(tx, input.currency, input.fee, 'increment');
-
     await writeLedger(tx, {
       account: LedgerAccount.MERCHANT,
       accountKey: input.merchantId,
@@ -321,25 +402,49 @@ export class SettlementService {
       referenceId: input.referenceId,
       balanceAfter,
     });
+
+    if (input.fee > 0n) {
+      await applyPlatform(tx, input.currency, input.fee, 'increment');
+      await writeLedger(tx, {
+        account: LedgerAccount.PLATFORM,
+        accountKey: 'PLATFORM',
+        merchantId: null,
+        currency: input.currency,
+        amount: input.fee,
+        type: LedgerType.CREDIT,
+        referenceId: input.referenceId,
+        balanceAfter: null,
+      });
+    }
+
+    // Counter-leg. The payer handed this money to the provider; it is the
+    // platform's liability until it is swept to a merchant balance. Without
+    // it the other two legs are both CREDITs and sum(debits) = 0, so the
+    // journal cannot be shown to balance.
     await writeLedger(tx, {
-      account: LedgerAccount.PLATFORM,
-      accountKey: 'PLATFORM',
+      account: LedgerAccount.PSP_CLEARING,
+      accountKey: 'PSP',
       merchantId: null,
       currency: input.currency,
-      amount: input.fee,
-      type: LedgerType.CREDIT,
+      amount: input.net + input.fee,
+      type: LedgerType.DEBIT,
       referenceId: input.referenceId,
       balanceAfter: null,
     });
   }
 
-  /** Post a DEBIT pair: the mirror of `post`, for refunds. */
+  /**
+   * Post a refund, the mirror of `post`.
+   *
+   *   DEBIT  MERCHANT       net   — reverse the merchant's earning
+   *   DEBIT  PLATFORM       fee   — reverse the platform's fee
+   *   CREDIT PSP_CLEARING   gross — funds returned to the payer
+   */
   private async pull(
     tx: Prisma.TransactionClient,
     input: { merchantId: string; currency: string; referenceId: string; fee: bigint; net: bigint },
   ) {
     const balanceAfter = await applyBalance(tx, input.merchantId, input.currency, input.net, 'decrement');
-    await applyPlatform(tx, input.currency, input.fee, 'decrement');
 
     await writeLedger(tx, {
       account: LedgerAccount.MERCHANT,
@@ -351,13 +456,29 @@ export class SettlementService {
       referenceId: input.referenceId,
       balanceAfter,
     });
+
+    if (input.fee > 0n) {
+      await applyPlatform(tx, input.currency, input.fee, 'decrement');
+      await writeLedger(tx, {
+        account: LedgerAccount.PLATFORM,
+        accountKey: 'PLATFORM',
+        merchantId: null,
+        currency: input.currency,
+        amount: input.fee,
+        type: LedgerType.DEBIT,
+        referenceId: input.referenceId,
+        balanceAfter: null,
+      });
+    }
+
+    // Mirror of the settlement counter-leg: funds flow back out to the payer.
     await writeLedger(tx, {
-      account: LedgerAccount.PLATFORM,
-      accountKey: 'PLATFORM',
+      account: LedgerAccount.PSP_CLEARING,
+      accountKey: 'PSP',
       merchantId: null,
       currency: input.currency,
-      amount: input.fee,
-      type: LedgerType.DEBIT,
+      amount: input.net + input.fee,
+      type: LedgerType.CREDIT,
       referenceId: input.referenceId,
       balanceAfter: null,
     });
@@ -365,24 +486,41 @@ export class SettlementService {
 }
 
 /**
- * Split a settled amount pro rata between fee and net.
+ * Split a settled amount pro rata between fee and net for one partial refund.
  *
- * Uses the largest-remainder method so that N partial refunds which together
- * equal the full amount always reverse exactly the original fee and net —
- * naive rounding would leak or over-debit by a minor unit per refund.
+ * Uses cumulative rounding: the split is computed against the running total
+ * already refunded, and the delta from what has previously been reversed is
+ * returned. When the cumulative refund reaches the gross amount the deltas sum
+ * to exactly the original fee and net.
+ *
+ * The previous implementation divided `totalFee * part / totalGross` on each
+ * refund independently. That truncates, so N partial refunds summing to the
+ * full gross reversed `totalFee - N` rather than `totalFee` — on a fully
+ * refunded payment the platform retained the entire fee, and the resulting
+ * over-debit could drive the merchant balance to zero and make the final
+ * refund unpayable.
  */
 export function splitProRata(
   totalFee: bigint,
-  totalNet: bigint,
   totalGross: bigint,
   part: bigint,
+  alreadyRefunded: bigint,
 ): { fee: bigint; net: bigint } {
-  if (totalGross <= 0n) {
+  if (totalGross <= 0n || part <= 0n) {
     return { fee: 0n, net: 0n };
   }
-  const fee = (totalFee * part) / totalGross;
-  const net = part - fee;
-  return { fee, net };
+
+  const cumulative = alreadyRefunded + part;
+  const feeCumulative = (totalFee * cumulative) / totalGross;
+  const netCumulative = cumulative - feeCumulative;
+
+  const feePrevious = (totalFee * alreadyRefunded) / totalGross;
+  const netPrevious = alreadyRefunded - feePrevious;
+
+  return {
+    fee: feeCumulative - feePrevious,
+    net: netCumulative - netPrevious,
+  };
 }
 
 function nowRefundedAfter(

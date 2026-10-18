@@ -108,20 +108,34 @@ export class PayoutService {
             data: { balance: { decrement: input.amountMinor } },
           });
 
-          // A payout moves money, so it gets ledger rows like any other
-          // movement. The merchant leg is a debit; the platform leg is a debit
-          // against the merchant's own funds leaving the platform.
-          await tx.ledgers.create({
-            data: {
-              publicId: generatePublicId('pf-ledger'),
-              account: 'MERCHANT',
-              accountKey: input.merchantId,
-              merchantId: input.merchantId,
-              currency: input.currency,
-              amount: input.amountMinor,
-              type: 'DEBIT',
-              referenceId: created.publicId,
-            },
+          // A payout leaves the platform, so it needs a counter-leg or the
+          // journal cannot balance. The merchant leg is a DEBIT against funds
+          // held on their behalf; the clearing leg is the matching CREDIT
+          // that leaves the platform's books. Both are written at schedule
+          // time so the position is complete while the transfer is in flight.
+          await tx.ledgers.createMany({
+            data: [
+              {
+                publicId: generatePublicId('pf-ledger'),
+                account: 'MERCHANT',
+                accountKey: input.merchantId,
+                merchantId: input.merchantId,
+                currency: input.currency,
+                amount: input.amountMinor,
+                type: 'DEBIT',
+                referenceId: created.publicId,
+              },
+              {
+                publicId: generatePublicId('pf-ledger'),
+                account: 'MERCHANT_CLEARING',
+                accountKey: input.merchantId,
+                merchantId: input.merchantId,
+                currency: input.currency,
+                amount: input.amountMinor,
+                type: 'CREDIT',
+                referenceId: created.publicId,
+              },
+            ],
           });
 
           await tx.resolution.create({
@@ -141,7 +155,15 @@ export class PayoutService {
         { maxWait: 10000, timeout: 20000 },
       );
 
-      await this.webhooks.dispatchPayoutEvent({ payoutId: payout.id, type: 'PAYOUT_PAID' });
+      // A payout is scheduled, not paid. Emitting PAYOUT_PAID here told the
+      // merchant's integration the money had been sent while the row was still
+      // SCHEDULED and the balance debit had not been matched by any bank
+      // transfer. PAYOUT_PAID is emitted by PayoutExecutor once the provider
+      // has actually accepted the transfer.
+      await this.webhooks.dispatchPayoutEvent({
+        payoutId: payout.id,
+        type: 'PAYOUT_SCHEDULED',
+      });
       return this.present(payout);
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
@@ -235,7 +257,22 @@ export class PayoutService {
           currency: payout.currency,
           amount: payout.amount,
           type: 'CREDIT',
-          referenceId: payout.publicId,
+          referenceId: `payout-reversal:${payout.publicId}`,
+        },
+      });
+
+      // Mirror of the clearing CREDIT written at schedule time, so a failed
+      // payout leaves the journal balanced rather than half-reversed.
+      await tx.ledgers.create({
+        data: {
+          publicId: generatePublicId('pf-ledger'),
+          account: 'MERCHANT_CLEARING',
+          accountKey: payout.merchantId,
+          merchantId: payout.merchantId,
+          currency: payout.currency,
+          amount: payout.amount,
+          type: 'DEBIT',
+          referenceId: `payout-reversal:${payout.publicId}`,
         },
       });
     });

@@ -98,10 +98,15 @@ describe('money', () => {
       });
     });
 
-    it('never returns a fee larger than the gross amount', () => {
-      const { fee, net } = splitFee(10n, { basisPoints: 10_000, minFeeMinor: 1_000n });
-      expect(fee).toBe(10n);
-      expect(net).toBe(0n);
+    it('clamps a fee larger than gross but rejects a zero net', () => {
+      // The fee is still clamped to gross. But net === 0 cannot be written to
+      // `Ledgers` (CHECK amount > 0), so this combination must throw rather
+      // than return an unwritable split.
+      expect(() => splitFee(10n, { basisPoints: 10_000, minFeeMinor: 1_000n })).toThrow(
+        /zero net/i,
+      );
+      expect(() => splitFee(1n, { basisPoints: 5_000 })).toThrow(/zero net/i);
+      expect(splitFee(1n, { basisPoints: 4_900 })).toEqual({ fee: 0n, net: 1n });
     });
 
     it('rejects a non-positive gross amount', () => {

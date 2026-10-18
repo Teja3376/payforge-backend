@@ -97,7 +97,21 @@ export function splitFee(
   if (fee > gross) {
     fee = gross;
   }
-  return { fee, net: gross - fee };
+  const net = gross - fee;
+
+  // A zero net cannot be written to the journal: `Ledgers` carries
+  // CHECK ("amount" > 0). Letting it through meant a merchant-settable 100%
+  // fee produced net === 0n, both settlement legs threw inside the
+  // transaction, and the rollback left the bank charge captured with the
+  // transaction stuck PENDING — which the one-open-per-payment index then
+  // turned into a permanent wedge on that payment.
+  if (net <= 0n) {
+    throw new Error(
+      `Fee schedule yields a zero net for gross=${gross}. ` +
+        `basisPoints must leave at least one minor unit to the merchant.`,
+    );
+  }
+  return { fee, net };
 }
 
 export function utcDateOnly(date = new Date()): Date {

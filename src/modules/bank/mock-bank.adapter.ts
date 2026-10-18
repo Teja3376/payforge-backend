@@ -61,7 +61,12 @@ export class MockBankAdapter implements BankPort {
   async createPayout(_input: {
     amountMinor: bigint;
     currency: string;
-    destinationToken: string;
+    destination: {
+      bankName: string;
+      accountHolder: string;
+      accountNumber: string;
+      routingNumber: string;
+    };
     idempotencyKey: string;
   }) {
     return { externalRef: `mock_po_${randomUUID().replace(/-/g, '')}` };
