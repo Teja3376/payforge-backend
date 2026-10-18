@@ -1,14 +1,60 @@
+# ===========================================================================
 # Build output
+# ===========================================================================
 /dist
-/node_modules
 /build
-/tmp
-coverage
+out
+*.tsbuildinfo
 
-# Package build output (the SDKs are published from here)
+# The SDKs in packages/ are published from their dist/. Sources are tracked,
+# compiled output is not.
 /packages/*/dist
 
+# `npm pack` tarballs, from anywhere in the tree
+*.tgz
+
+# ===========================================================================
+# Dependencies
+# ===========================================================================
+node_modules/
+.pnpm-store/
+
+# Yarn PnP / Plug'n'Play
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/releases
+!.yarn/plugins
+!.yarn/sdks
+!.yarn/versions
+
+# ===========================================================================
+# Environment files and secrets
+#
+# `.env*` catches `.env.local`, `.env.staging`, `.env.production.local`,
+# `.env.backup` and every other variant — the original list named only four
+# exact filenames, which is how real database credentials end up committed.
+# `.env.example` is re-included below so the template stays tracked.
+#
+# Rotate anything that has been in a committed `.env`: git history keeps it.
+# ===========================================================================
+.env
+.env.*
+!.env.example
+.envrc
+
+# TLS material and private keys, if anyone drops one in the repo root
+*.pem
+*.key
+*.p12
+*.pfx
+
+# .npmrc frequently holds registry auth tokens
+.npmrc
+
+# ===========================================================================
 # Logs
+# ===========================================================================
 logs
 *.log
 npm-debug.log*
@@ -17,17 +63,50 @@ yarn-debug.log*
 yarn-error.log*
 lerna-debug.log*
 
-# Environment files.
-# `.env*` covers .env, .env.local, .env.staging, .env.production.local — the
-# variants the original list missed, which is how real credentials get
-# committed by accident. The `.env.example` template is re-included below.
-.env
-.env.*
-!.env.example
+# ===========================================================================
+# Tests
+# ===========================================================================
+coverage/
+.nyc_output/
+junit.xml
 
-# Local CLI credentials written by `payforge login`
+# ===========================================================================
+# Local tooling state
+# ===========================================================================
+
+# Credentials written by `payforge login`
 .payforge/
 
-# temp directory
-.temp
+# Local database / shadow databases used by prisma migrate diff
+*.db
+*.db-journal
+prisma/*.db
+
+# ===========================================================================
+# Editors and IDEs
+# ===========================================================================
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+*~
+
+# ===========================================================================
+# OS cruft
+# ===========================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ===========================================================================
+# temp
+# ===========================================================================
 .tmp
+.temp
+.cache
