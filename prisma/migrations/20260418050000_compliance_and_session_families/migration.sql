@@ -26,6 +26,10 @@ CREATE TABLE "MerchantRisk" (
     CONSTRAINT "MerchantRisk_pkey" PRIMARY KEY ("id")
 );
 
+-- The enum must exist before the table that uses it as a column type. Creating
+-- the table first fails with `type "ProviderOnboarding" does not exist`.
+CREATE TYPE "ProviderOnboarding" AS ENUM ('NOT_STARTED', 'PENDING', 'RESTRICTED', 'ENABLED', 'DISABLED');
+
 CREATE TABLE "MerchantProviderAccount" (
     "id"                TEXT NOT NULL,
     "publicId"          TEXT NOT NULL,
@@ -42,8 +46,6 @@ CREATE TABLE "MerchantProviderAccount" (
 
     CONSTRAINT "MerchantProviderAccount_pkey" PRIMARY KEY ("id")
 );
-
-CREATE TYPE "ProviderOnboarding" AS ENUM ('NOT_STARTED', 'PENDING', 'RESTRICTED', 'ENABLED', 'DISABLED');
 
 -- One provider account per merchant; more than one PSP would need a unique
 -- index on (merchantId, provider) instead.

@@ -7,19 +7,12 @@
 -- deliveries were stranded permanently with no reaper — the exact failure the
 -- "sweep anything left PENDING by a process restart" comment claimed to catch.
 --
--- IN_FLIGHT is now the claimed state, and `nextAttemptAt` carries a lease while
+-- IN_FLIGHT is now the claimed state, and nextAttemptAt carries a lease while
 -- it is held. A row still IN_FLIGHT past its lease belonged to a dead process
 -- and is reclaimed by the next sweep.
+--
+-- Enum-only: PostgreSQL refuses to use an enum value added by ALTER TYPE ...
+-- ADD VALUE within the same transaction, and the sweep index in the next
+-- migration depends on 'IN_FLIGHT'.
 
 ALTER TYPE "DeliveryStatus" ADD VALUE IF NOT EXISTS 'IN_FLIGHT';
-
--- The sweep now filters on (status IN (PENDING, IN_FLIGHT)) AND nextAttemptAt,
--- and excludes deliveries belonging to a disabled endpoint. The old index was
--- (status) only.
-CREATE INDEX IF NOT EXISTS "WebhookDelivery_sweep_idx"
-  ON "WebhookDelivery" ("status", "nextAttemptAt")
-  WHERE "status" IN ('PENDING', 'IN_FLIGHT');
-
--- Auto-disable counts dead deliveries per endpoint within a 24h window.
-CREATE INDEX IF NOT EXISTS "WebhookDelivery_endpoint_status_idx"
-  ON "WebhookDelivery" ("endpointId", "status", "updatedAt");

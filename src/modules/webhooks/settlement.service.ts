@@ -130,7 +130,7 @@ export class SettlementService {
             }
 
             // CANCELLED (or any other terminal state): the provider captured
-            // the funds regardless, so the ledger must reflect them. Leaving
+            // the funds regardless, so the journal must reflect them. Leaving
             // this unposted stranded real money at the bank with no merchant
             // credit, no platform fee, and nothing to reconcile against.
             this.log.error(
@@ -138,16 +138,16 @@ export class SettlementService {
               'settled a charge on a cancelled payment — posting from captured funds',
             );
 
-            await this.post(tx, {
-              merchantId: existing.payment.merchantId,
-              currency: existing.currency,
-              referenceId: `settlement:${existing.publicId}`,
-              fee,
-              net,
-            });
-
-            // Move the payment to SUCCESS so the merchant sees real money and
-            // the refund path becomes available to them if they want it back.
+            // Repair the payment state only. The journal posting happens once,
+            // below, in the shared `if (succeeded)` block.
+            //
+            // Posting here as well was a real defect: it wrote the same
+            // referenceId twice, so the second post collided on
+            // [account, accountKey, referenceId, type], aborted the whole
+            // transaction, and — because `withPublicId` retries a unique
+            // violation — surfaced as a misleading
+            // "current transaction is aborted" rather than the collision
+            // itself. Found by the integration suite, not by any unit test.
             await tx.payments.update({
               where: { id: existing.paymentId },
               data: { status: PaymentStatus.SUCCESS, cancelledReason: null },
@@ -770,9 +770,17 @@ async function writeLedger(
   );
 }
 
+/**
+ * Whether this error is a retryable collision on a generated public id.
+ *
+ * Only P2002 (unique constraint) counts. P2003 is a foreign-key violation and
+ * is not a collision: retrying it with a fresh public id cannot succeed, and
+ * inside a Postgres transaction the first failure aborts the transaction, so
+ * the retry surfaces a misleading
+ * "current transaction is aborted" error and hides the real cause.
+ */
 export function isUniqueViolation(error: unknown): boolean {
   return (
-    error instanceof Prisma.PrismaClientKnownRequestError &&
-    (error.code === 'P2002' || error.code === 'P2003')
+    error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002'
   );
 }
