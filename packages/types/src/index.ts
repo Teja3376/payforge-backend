@@ -191,6 +191,19 @@ export type Merchant = {
   settlementCurrency: string;
   settlementDelayDays: number;
   feeBasisPoints: number;
+  /**
+   * Which environment this merchant transacts in.
+   *
+   * The server gates test-card acceptance on this field, not on `ApiKey.mode`:
+   * `ApiKey.mode` is stored and displayed but never enforced.
+   */
+  mode?: 'TEST' | 'LIVE';
+  /** The per-merchant fee schedule, when one has been set. */
+  feeSchedule?: {
+    basisPoints: number;
+    minFeeMinor?: string | null;
+    maxFeeMinor?: string | null;
+  };
   kyc: { status: string } & Record<string, unknown>;
   balances: Balance[];
   createdAt: string;

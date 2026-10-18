@@ -5,7 +5,18 @@
   "license": "MIT",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "files": ["dist"],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
   "sideEffects": false,
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -18,11 +29,19 @@
     "react": ">=18"
   },
   "peerDependenciesMeta": {
-    "react": { "optional": false }
+    "react": {
+      "optional": false
+    }
   },
   "devDependencies": {
     "@types/react": "^19.0.0",
     "typescript": "^5.7.3"
   },
-  "publishConfig": { "access": "public" }
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/payforge/payforge-backend.git"
+  }
 }

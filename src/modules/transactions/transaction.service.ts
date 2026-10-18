@@ -62,7 +62,16 @@ export class TransactionService {
       where: { publicId: dto.paymentPublicId },
       include: { merchant: true },
     });
-    if (!payment || payment.userId !== user.id) {
+    if (
+      !payment ||
+      // Either the payer, or the merchant who created the payment and is
+      // charging it through their own API key. API-key principals resolve to
+      // role MERCHANT with the merchantId on the request user, which is what
+      // makes the payment-intent flow reachable from a merchant server.
+      (user.actorType === 'API_KEY'
+        ? payment.merchantId !== user.merchantId
+        : payment.userId !== user.id && payment.merchantId !== user.merchantId)
+    ) {
       throw ApiError.of(ErrorCode.PAYMENT_NOT_FOUND);
     }
     if (payment.merchant.status !== AccountStatus.ACTIVE) {

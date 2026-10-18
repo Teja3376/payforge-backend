@@ -48,8 +48,21 @@ export class PayForgeError extends Error {
 }
 
 export type PayForgeClientOptions = {
-  /** API key. Server-side only — never ship this to a browser. */
-  apiKey: string;
+  /**
+   * API key. Server-side only — never ship this to a browser.
+   *
+   * Mutually exclusive with `accessToken`. The server rejects a request that
+   * carries both credential types rather than guessing which was intended.
+   */
+  apiKey?: string;
+  /**
+   * A login access token, for operator and dashboard flows.
+   *
+   * The server accepts either an API key or a session JWT, never both. This
+   * option existed to be the second half of that: without it the client could
+   * only ever present an API key, so every `/auth/*` route was unreachable.
+   */
+  accessToken?: string | (() => string | Promise<string>);
   /** Defaults to `https://api.payforge.dev/v1`. */
   baseUrl?: string;
   /** Per-request timeout in ms. Defaults to 30_000. */
@@ -68,6 +81,33 @@ type RequestOptions = {
   query?: Record<string, string | number | boolean | undefined>;
   idempotencyKey?: string;
   signal?: AbortSignal;
+  /** Send no credential. Used by `/auth/login` and `/auth/refresh`. */
+  anonymous?: boolean;
+};
+
+/** Response of POST /auth/login and POST /auth/refresh. */
+export type SessionResponse = {
+  accessToken: string;
+  refreshToken: string;
+  expiresIn: number;
+  tokenType: 'Bearer';
+  user?: {
+    publicId: string;
+    email: string;
+    role: string;
+    merchantPublicId: string | null;
+    merchantStatus: string | null;
+  };
+};
+
+/** One row of GET /auth/sessions. */
+export type SessionSummary = {
+  publicId: string;
+  userAgent: string | null;
+  ip: string | null;
+  createdAt: string;
+  lastUsedAt: string | null;
+  expiresAt: string;
 };
 
 const DEFAULT_BASE_URL = 'https://api.payforge.dev/v1';
@@ -84,7 +124,8 @@ const DEFAULT_BASE_URL = 'https://api.payforge.dev/v1';
  * backend — an API key must never ship to a client.
  */
 export class PayForge {
-  private readonly apiKey: string;
+  private readonly apiKey: string | undefined;
+  private readonly accessToken: string | (() => string | Promise<string>) | undefined;
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
@@ -92,16 +133,58 @@ export class PayForge {
   private readonly extraHeaders: Record<string, string>;
 
   constructor(options: PayForgeClientOptions) {
-    if (!options.apiKey) {
-      throw new Error('An API key is required. Create one from your PayForge dashboard.');
+    if (!options.apiKey && !options.accessToken) {
+      throw new Error(
+        'A credential is required: pass `apiKey` for server integrations or `accessToken` for operator sessions.',
+      );
+    }
+    if (options.apiKey && options.accessToken) {
+      // The server rejects a request carrying both, so fail here with a clear
+      // message rather than 401 on every call.
+      throw new Error('Pass either `apiKey` or `accessToken`, not both.');
     }
     this.apiKey = options.apiKey;
+    this.accessToken = options.accessToken;
     this.baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, '');
     this.timeoutMs = options.timeoutMs ?? 30_000;
     this.maxRetries = options.maxRetries ?? 2;
     this.fetchImpl = options.fetch ?? globalThis.fetch;
     this.extraHeaders = options.headers ?? {};
+
+    if (typeof globalThis.window !== 'undefined' && this.apiKey) {
+      // Not a security boundary — a bundler can strip this — but it turns a
+      // silent leak into an immediate, obvious failure.
+      throw new Error(
+        'An API key was supplied in a browser environment. API keys must stay on your server; ' +
+          'use `@payforge/react` with a client secret minted by your backend instead.',
+      );
+    }
   }
+
+  // --- Authentication --------------------------------------------------------
+
+  /**
+   * Session authentication.
+   *
+   * These routes are unusable with an API key: they operate on a user's own
+   * sessions rather than a merchant's.
+   */
+  auth = {
+    login: (input: { email: string; password: string }) =>
+      this.request<SessionResponse>('POST', '/auth/login', { body: input, anonymous: true }),
+
+    refresh: (input: { refreshToken: string }) =>
+      this.request<SessionResponse>('POST', '/auth/refresh', { body: input, anonymous: true }),
+
+    logout: () => this.request<void>('POST', '/auth/logout'),
+
+    changePassword: (input: { currentPassword: string; newPassword: string }) =>
+      this.request<{ changed: boolean }>('POST', '/auth/password', { body: input }),
+
+    listSessions: () => this.request<SessionSummary[]>('GET', '/auth/sessions'),
+
+    revokeSession: (publicId: string) => this.request<void>('DELETE', `/auth/sessions/${publicId}`),
+  };
 
   // --- Payments -------------------------------------------------------------
 
@@ -316,9 +399,13 @@ export class PayForge {
   /**
    * Issue a request with retries.
    *
-   * Only 429 and 5xx are retried, and only when no idempotency key was sent —
-   * retrying a non-idempotent write after an ambiguous failure is how you get
-   * two payments for one order. Anything else is surfaced immediately.
+   * 429 and 5xx are retried, and only when an idempotency key was sent:
+   * retrying an identical keyed request is safe, whereas retrying a
+   * non-idempotent write after an ambiguous failure is how you get two payments
+   * for one order. Anything else is surfaced immediately.
+   *
+   * (An earlier version of this comment claimed the opposite condition. The
+   * code was always right; the comment was wrong.)
    */
   private async request<T>(
     method: NonNullable<RequestOptions['method']>,
@@ -334,9 +421,25 @@ export class PayForge {
 
     const headers: Record<string, string> = {
       accept: 'application/json',
-      'x-api-key': this.apiKey,
       ...this.extraHeaders,
     };
+
+    // Exactly one credential. The server rejects a request carrying both, so
+    // the SDK never sends both even if `headers` happens to contain one: the
+    // authenticated credential is applied last and wins.
+    if (options.anonymous) {
+      delete headers['x-api-key'];
+      delete headers['authorization'];
+    } else if (this.apiKey) {
+      headers['x-api-key'] = this.apiKey;
+      delete headers['authorization'];
+    } else if (this.accessToken) {
+      const token =
+        typeof this.accessToken === 'function' ? await this.accessToken() : this.accessToken;
+      headers['authorization'] = `Bearer ${token}`;
+      delete headers['x-api-key'];
+    }
+
     if (options.body !== undefined) {
       headers['content-type'] = 'application/json';
     }

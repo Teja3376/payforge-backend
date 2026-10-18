@@ -38,12 +38,16 @@ export class PaymentController {
   ) {}
 
   @Post()
-  @Roles(Role.USER)
-  @Authenticated()
+  @Roles(Role.USER, Role.MERCHANT, Role.SUPER_ADMIN)
+  @Scopes(Scope.PAYMENTS_WRITE)
   @ApiOperation({
     summary: 'Create a payment',
     description:
-      'Freezes the FX quote and reserves the amount. Requires an `Idempotency-Key` header. Returns 200 on replay of a previously accepted key.',
+      'Freezes the FX quote and reserves the amount. Requires an `Idempotency-Key` header. ' +
+      'Returns 200 on replay of a previously accepted key. ' +
+      '\n\nA merchant may create a payment on behalf of a customer — this is the ' +
+      'payment-intent flow: the merchant\'s server creates it, then hands the ' +
+      'customer a client session to tokenise their card.',
   })
   @ApiHeader({ name: 'Idempotency-Key', required: true })
   @ApiCreatedResponse({ type: PaymentResponseDto, description: 'A new payment.' })

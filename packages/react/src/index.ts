@@ -13,6 +13,9 @@ import type { ClientSession, SavedPaymentMethod } from '@payforge/types';
  *   const { tokenize, isReady } = usePayForgeCard({ clientSecret });
  *   <PayForgeCardField onTokenize={tokenize} />
  *
+ * (The above is illustrative. The shipped API is `PayForgeProvider` plus
+ * `usePayForge`, both re-exported from this module.)
+ *
  * `clientSecret` must be minted on your server — it is a short-lived,
  * single-use credential and must not be hard-coded in a browser bundle.
  */
@@ -80,13 +83,10 @@ export function createCardController(options: PayForgeCardOptions): PayForgeCard
       if (!options.clientSecret) {
         throw new Error('A client secret is required. Mint one on your server first.');
       }
-      const factory = (globalThis as Record<string, unknown>).PayForgeFields;
-      if (typeof factory !== 'function') {
-        throw new Error(
-          'The PayForge Fields script is not loaded. Add the provider <script> tag before mounting.',
-        );
-      }
-      instance = await (factory as (config: unknown) => Promise<unknown>)({
+
+      const factory = resolveFieldsFactory();
+
+      instance = await factory({
         clientSecret: options.clientSecret,
         fields: options.fields ?? { cardholderName: true },
         locale: options.locale ?? 'en',
@@ -143,16 +143,57 @@ export function createCardController(options: PayForgeCardOptions): PayForgeCard
 }
 
 /**
+ * Locate the hosted-fields factory.
+ *
+ * The global is supplied by the script tag on the merchant's checkout page:
+ *
+ *   <script src="https://js.payforge.dev/fields/v1/payforge-fields.js"></script>
+ *
+ * PayForge does not bundle or vendor it, because the iframe that captures card
+ * data has to come from whichever processor actually moves the money. Until
+ * PayForge is pointed at a live processor there is nothing to serve, so this
+ * resolves `window.PayForgeFields` and nothing else.
+ *
+ * The error names the script tag explicitly. The previous message said only
+ * "Add the provider <script> tag", with no URL and no hint about which
+ * provider, which left the most common integration failure undiagnosable.
+ */
+function resolveFieldsFactory(): (config: unknown) => Promise<unknown> {
+  const injected = (globalThis as Record<string, unknown>).PayForgeFields;
+  if (typeof injected === 'function') {
+    return injected as (config: unknown) => Promise<unknown>;
+  }
+
+  throw new Error(
+    'PayForge Fields is not loaded.\n\n' +
+      'Add this to your checkout page before React mounts:\n\n' +
+      '  <script src="https://js.payforge.dev/fields/v1/payforge-fields.js"></script>\n\n' +
+      'It must load before you call mount(). If you self-host it, point\n' +
+      'window.PayForgeFields at your own copy.',
+  );
+}
+
+/**
  * Test card numbers.
  *
- * Only usable with a TEST-mode API key. The server rejects these BINs when the
- * key is live, so a test card cannot move real money even by mistake.
+ * These are rejected when the *merchant* is in LIVE mode — the test-BIN block
+ * reads `Merchants.mode`, not the API key's mode. (An earlier version of this
+ * comment said "TEST-mode API key", which described a control that does not
+ * exist: `ApiKey.mode` is stored and displayed but never enforced.)
  */
 export const TEST_CARDS = [
   { brand: 'Visa', number: '4111111111111111', cvv: '123', expiry: '12/34' },
   { brand: 'Mastercard', number: '5555555555554444', cvv: '123', expiry: '12/34' },
   { brand: 'Amex', number: '378282246310005', cvv: '1234', expiry: '12/34' },
-  { brand: 'Rupeay', number: '6011111111111117', cvv: '123', expiry: '12/34' },
+  { brand: 'RuPay', number: '6011111111111117', cvv: '123', expiry: '12/34' },
+  { brand: 'Declines', number: '4000000000000002', cvv: '123', expiry: '12/34' },
 ] as const;
 
 export type { ClientSession, SavedPaymentMethod };
+
+// The React surface is part of this package's public API. It was defined in
+// ./react but never re-exported here, and with no `exports` map the only way
+// to reach it was the undocumented deep path '@payforge/react/dist/react' —
+// so `import { PayForgeProvider } from '@payforge/react'` did not compile.
+export { PayForgeProvider, usePayForge } from './react';
+export type { PayForgeContextValue, PayForgeProviderProps } from './react';

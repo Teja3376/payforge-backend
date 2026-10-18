@@ -15,6 +15,8 @@ import type { Response } from 'express';
 import type { RequestUser } from '../../common/auth/request-user';
 import { CurrentUser, IdempotencyKey } from '../../common/decorators/current-user.decorator';
 import { Authenticated, Roles } from '../../common/decorators/roles.decorator';
+import { Scopes } from '../../common/decorators/scopes.decorator';
+import { Scope } from '../../common/scopes/scopes';
 import { PaginationQueryDto } from '../../common/pagination/pagination';
 import { ApiErrorDto } from '../../common/swagger/api-error.dto';
 import { assertPublicId } from '../payments/payment.controller';
@@ -28,12 +30,15 @@ export class TransactionController {
   constructor(private readonly transactions: TransactionService) {}
 
   @Post()
-  @Roles(Role.USER)
-  @Authenticated()
+  @Roles(Role.USER, Role.MERCHANT, Role.SUPER_ADMIN)
+  @Scopes(Scope.PAYMENTS_WRITE)
   @ApiOperation({
     summary: 'Pay a payment',
     description:
-      'Returns 201 for a new attempt and 200 when the same Idempotency-Key and payload are replayed. Prefer charging a saved method over resending card data.',
+      'Returns 201 for a new attempt and 200 when the same Idempotency-Key and payload are replayed. ' +
+      'Prefer charging a saved method over resending card data. ' +
+      '\n\nA merchant API key may charge a payment it created, which is what makes the ' +
+      'payment-intent flow usable end to end from a merchant server.',
   })
   @ApiHeader({ name: 'Idempotency-Key', required: true })
   @ApiCreatedResponse({ type: TransactionResponseDto, description: 'A new pending transaction.' })
