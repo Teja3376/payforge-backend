@@ -11,11 +11,15 @@ import { AuthService } from './auth.service';
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
         secret: config.getOrThrow<string>('JWT_SECRET'),
-        signOptions: { expiresIn: '7d' },
+        // Short access tokens: revocation is handled by refresh-token sessions,
+        // so there is no need for a long-lived, unrevocable bearer.
+        signOptions: { expiresIn: '1h', issuer: 'payforge', audience: 'payforge-api' },
+        verifyOptions: { issuer: 'payforge', audience: 'payforge-api', algorithms: ['HS256'] },
       }),
     }),
   ],
   controllers: [AuthController],
   providers: [AuthService],
+  exports: [JwtModule],
 })
 export class AuthModule {}

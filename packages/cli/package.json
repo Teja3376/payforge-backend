@@ -1,0 +1,19 @@
+{
+  "name": "@payforge/cli",
+  "version": "1.0.0",
+  "description": "Local development toolkit for PayForge integrations.",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": { "payforge": "dist/index.js" },
+  "files": ["dist"],
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  },
+  "publishConfig": { "access": "public" }
+}

@@ -1,0 +1,28 @@
+{
+  "name": "@payforge/react",
+  "version": "1.0.0",
+  "description": "React bindings for PayForge hosted card fields. Keeps card data out of your servers.",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@payforge/types": "1.0.0"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "react": { "optional": false }
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "typescript": "^5.7.3"
+  },
+  "publishConfig": { "access": "public" }
+}

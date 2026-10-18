@@ -2,62 +2,194 @@ generator client {
   provider = "prisma-client-js"
 }
 
-generator client_local {
-  provider = "prisma-client-js"
-  output   = "../generated/prisma"
-}
-
 datasource db {
   provider  = "postgresql"
   url       = env("DATABASE_URL")
   directUrl = env("DIRECT_URL")
 }
 
-model Users {
-  id           String        @id @default(uuid())
-  publicId     String        @unique
-  email        String        @unique
-  passwordHash String
-  countryCode  String
-  role         Role
-  status       AccountStatus @default(ACTIVE)
-  merchantId   String?       @unique
-  createdAt    DateTime      @default(now())
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
 
-  merchant     Merchants?     @relation(fields: [merchantId], references: [id])
-  payments     Payments[]
+model Users {
+  id            String        @id @default(uuid())
+  publicId      String        @unique
+  email         String        @unique
+  passwordHash  String
+  countryCode   String
+  role          Role
+  status        AccountStatus @default(ACTIVE)
+  merchantId    String?
+  failedLogins  Int           @default(0)
+  lockedUntil   DateTime?
+  lastLoginAt   DateTime?
+  passwordChangedAt DateTime  @default(now())
+  deletedAt     DateTime?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  merchant   Merchants?  @relation(fields: [merchantId], references: [id])
+  payments   Payments[]
   transactions Transactions[]
-  resolutions  Resolution[]
+  resolutions Resolution[]
+  sessions   Session[]
+  loginAttempts LoginAttempt[]
+
+  @@index([merchantId])
+  @@index([createdAt])
 }
 
-model Merchants {
-  id        String        @id @default(uuid())
-  publicId  String        @unique
-  name      String
-  email     String        @unique
-  status    AccountStatus @default(ACTIVE)
-  createdAt DateTime      @default(now())
+// Refresh-token sessions give explicit revocation (no 7-day unrevocable bearer).
+model Session {
+  id               String    @id @default(uuid())
+  publicId         String    @unique
+  userId           String
+  // Refresh tokens are looked up by digest, so this must be unique.
+  refreshTokenHash String    @unique
+  userAgent        String?
+  ip               String?
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  lastUsedAt       DateTime?
+  createdAt        DateTime  @default(now())
 
-  user     Users?
-  payments Payments[]
-  ledgers  Ledgers[]
-  balances MerchantBalance[]
+  user Users @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt])
+}
+
+model LoginAttempt {
+  id        String   @id @default(uuid())
+  email     String
+  ip        String?
+  succeeded Boolean
+  createdAt DateTime @default(now())
+
+  userId String?
+  user   Users? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([email, createdAt])
+  @@index([ip, createdAt])
+}
+
+// Machine credentials. `prefix` is the lookup key; `hash` is the only secret.
+model ApiKey {
+  id         String    @id @default(uuid())
+  publicId   String    @unique
+  merchantId String?
+  name       String
+  prefix     String    @unique
+  // Only ever stored as a SHA-256 digest. Uniqueness here is what makes the
+  // per-request lookup an indexed equality match instead of a table scan.
+  hash       String    @unique
+  scopes     String[]
+  mode       KeyMode   @default(LIVE)
+  lastUsedAt DateTime?
+  expiresAt  DateTime?
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  merchant Merchants? @relation(fields: [merchantId], references: [id])
+
+  @@index([merchantId, revokedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Merchant
+// ---------------------------------------------------------------------------
+
+model Merchants {
+  id                    String        @id @default(uuid())
+  publicId              String        @unique
+  name                  String
+  email                 String        @unique
+  status                AccountStatus @default(PENDING_REVIEW)
+  countryCode           String        @default("IN")
+  // Which environment this merchant transacts in. TEST merchants accept test
+  // card numbers and never move real money; LIVE merchants reject them.
+  //
+  // The payer is always a customer on a session JWT and carries no
+  // environment, so the merchant is the only place this distinction can live.
+  mode                  KeyMode       @default(TEST)
+  settlementCurrency    String        @default("INR")
+  settlementDelayDays   Int           @default(2)
+  defaultFeeBasisPoints Int           @default(200)
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+  deletedAt             DateTime?
+
+  users         Users[]
+  payments      Payments[]
+  ledgers       Ledgers[]
+  balances      MerchantBalance[]
+  apiKeys       ApiKey[]
+  webhookEndpoints WebhookEndpoint[]
+  payoutDestinations PayoutDestination[]
+  payouts       Payout[]
+  kyc           MerchantKyc?
+  feeSchedule   MerchantFeeSchedule?
+  paymentMethods SavedPaymentMethod[]
+
+  @@index([createdAt])
+}
+
+model MerchantKyc {
+  id                 String    @id @default(uuid())
+  merchantId         String    @unique
+  legalName          String?
+  registrationNumber String?
+  taxId              String?
+  countryCode        String?
+  addressLine1       String?
+  addressLine2       String?
+  city               String?
+  postalCode         String?
+  status             KycStatus @default(NOT_STARTED)
+  rejectionReason    String?
+  submittedAt        DateTime?
+  reviewedAt         DateTime?
+  reviewedById       String?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  merchant Merchants @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+}
+
+model MerchantFeeSchedule {
+  id            String   @id @default(uuid())
+  merchantId    String   @unique
+  basisPoints   Int
+  minFeeMinor   BigInt   @default(0)
+  maxFeeMinor   BigInt?
+  effectiveFrom DateTime @default(now())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  merchant Merchants @relation(fields: [merchantId], references: [id], onDelete: Cascade)
 }
 
 model MerchantBalance {
-  id         String    @id @default(uuid())
+  id         String   @id @default(uuid())
   merchantId String
   currency   String
-  balance    BigInt    @default(0)
-  merchant   Merchants @relation(fields: [merchantId], references: [id])
+  balance    BigInt   @default(0)
+  pending    BigInt   @default(0)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  merchant Merchants @relation(fields: [merchantId], references: [id], onDelete: Cascade)
 
   @@unique([merchantId, currency])
 }
 
 model PlatformAccount {
-  id       String @id @default(uuid())
-  currency String @unique
-  balance  BigInt @default(0)
+  id        String   @id @default(uuid())
+  currency  String   @unique
+  balance   BigInt   @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 model ExchangeRateSnapshot {
@@ -67,6 +199,10 @@ model ExchangeRateSnapshot {
   rates     Json
   fetchedAt DateTime @default(now())
 }
+
+// ---------------------------------------------------------------------------
+// Money movement
+// ---------------------------------------------------------------------------
 
 model Payments {
   id                 String        @id @default(uuid())
@@ -80,16 +216,28 @@ model Payments {
   inrRate            Decimal       @db.Decimal(24, 10)
   settlementAmount   BigInt
   settlementCurrency String
+  feeBasisPoints     Int           @default(200)
   status             PaymentStatus
+  idempotencyKey     String?
+  refundedAmount     BigInt        @default(0)
+  expiresAt          DateTime
+  description        String?
+  metadata           Json?
+  cancelledReason    String?
   createdAt          DateTime      @default(now())
   updatedAt          DateTime      @updatedAt
 
   user         Users          @relation(fields: [userId], references: [id])
   merchant     Merchants      @relation(fields: [merchantId], references: [id])
   transactions Transactions[]
+  refunds      Refund[]
+  clientSessions ClientSession[]
 
-  @@index([userId])
-  @@index([merchantId])
+  @@unique([userId, idempotencyKey])
+  @@index([userId, createdAt])
+  @@index([merchantId, createdAt])
+  @@index([status, createdAt])
+  @@index([createdAt])
 }
 
 model Transactions {
@@ -106,7 +254,11 @@ model Transactions {
   amount         BigInt
   fee            BigInt            @default(0)
   netAmount      BigInt            @default(0)
+  failureCode    String?
+  failureMessage String?
+  settledAt      DateTime?
   createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
 
   user             Users              @relation(fields: [userId], references: [id])
   payment          Payments           @relation(fields: [paymentId], references: [id])
@@ -114,47 +266,15 @@ model Transactions {
   upiDetail        UpiDetails?
   netBankingDetail NetBankingDetails?
   walletDetail     WalletDetails?
+  refunds          Refund[]
 
   @@unique([userId, idempotencyKey])
   @@index([paymentId])
+  @@index([createdAt])
+  @@index([status, createdAt])
 }
 
-model CardDetails {
-  id            String    @id @default(uuid())
-  transactionId String    @unique
-  holderName    String
-  brand         CardBrand
-  last4         String
-  expiryMonth   Int
-  expiryYear    Int
-
-  transaction Transactions @relation(fields: [transactionId], references: [id])
-}
-
-model UpiDetails {
-  id            String @id @default(uuid())
-  transactionId String @unique
-  vpa           String
-
-  transaction Transactions @relation(fields: [transactionId], references: [id])
-}
-
-model NetBankingDetails {
-  id            String @id @default(uuid())
-  transactionId String @unique
-  bankCode      String
-
-  transaction Transactions @relation(fields: [transactionId], references: [id])
-}
-
-model WalletDetails {
-  id            String         @id @default(uuid())
-  transactionId String         @unique
-  provider      WalletProvider
-
-  transaction Transactions @relation(fields: [transactionId], references: [id])
-}
-
+// Append-only money journal. Exactly two rows per movement (MERCHANT + PLATFORM).
 model Ledgers {
   id          String         @id @default(uuid())
   publicId    String         @unique
@@ -165,25 +285,242 @@ model Ledgers {
   amount      BigInt
   type        LedgerType
   referenceId String
+  balanceAfter BigInt?
   createdAt   DateTime       @default(now())
 
   merchant Merchants? @relation(fields: [merchantId], references: [id])
 
   @@unique([account, accountKey, referenceId, type])
   @@index([account, currency, createdAt])
+  @@index([merchantId, createdAt])
+  @@index([referenceId])
 }
+
+model Refund {
+  id             String       @id @default(uuid())
+  publicId       String       @unique
+  paymentId      String
+  transactionId  String
+  merchantId     String
+  amount         BigInt
+  currency       String
+  feeReversed    BigInt       @default(0)
+  netReversed    BigInt       @default(0)
+  reason         String?
+  status         RefundStatus @default(SUCCEEDED)
+  idempotencyKey String
+  createdById    String
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  payment     Payments    @relation(fields: [paymentId], references: [id])
+  transaction Transactions @relation(fields: [transactionId], references: [id])
+
+  @@unique([merchantId, idempotencyKey])
+  @@index([paymentId, createdAt])
+  @@index([merchantId, createdAt])
+}
+
+model PayoutDestination {
+  id            String            @id @default(uuid())
+  publicId      String            @unique
+  merchantId    String
+  bankName      String
+  accountHolder String
+  accountLast4  String
+  accountEnc    String
+  routingEnc    String
+  currency      String
+  status        DestinationStatus @default(ACTIVE)
+  isDefault     Boolean           @default(false)
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  merchant Merchants @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  payouts  Payout[]
+
+  @@index([merchantId, status])
+}
+
+model Payout {
+  id             String       @id @default(uuid())
+  publicId       String       @unique
+  merchantId     String
+  destinationId  String?
+  amount         BigInt
+  currency       String
+  status         PayoutStatus @default(SCHEDULED)
+  externalRef    String?
+  failureReason  String?
+  idempotencyKey String
+  requestedById  String?
+  processedAt    DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  merchant    Merchants          @relation(fields: [merchantId], references: [id])
+  destination PayoutDestination? @relation(fields: [destinationId], references: [id])
+
+  @@unique([merchantId, idempotencyKey])
+  @@index([merchantId, createdAt])
+  @@index([status, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Tokenization (PCI: PAN never reaches PayForge in the hosted-fields flow)
+// ---------------------------------------------------------------------------
+
+model ClientSession {
+  id               String    @id @default(uuid())
+  publicId         String    @unique
+  secretHash       String    @unique
+  paymentId        String?
+  merchantId       String
+  expiresAt        DateTime
+  consumedAt       DateTime?
+  createdAt        DateTime  @default(now())
+
+  payment Payments? @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@index([merchantId, expiresAt])
+}
+
+model SavedPaymentMethod {
+  id           String        @id @default(uuid())
+  publicId     String        @unique
+  merchantId   String
+  customerRef  String?
+  type         PaymentMethod @default(CARD)
+  gatewayToken String        @unique
+  brand        CardBrand?
+  last4        String?
+  expiryMonth  Int?
+  expiryYear   Int?
+  holderName   String?
+  status       SavedMethodStatus @default(ACTIVE)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  merchant Merchants @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@index([merchantId, status])
+  @@index([merchantId, customerRef])
+}
+
+// ---------------------------------------------------------------------------
+// Outbound webhooks
+// ---------------------------------------------------------------------------
+
+model WebhookEndpoint {
+  id          String                @id @default(uuid())
+  publicId    String                @unique
+  merchantId  String
+  url         String
+  secretEnc   String
+  events      String[]
+  status      WebhookEndpointStatus @default(ACTIVE)
+  description String?
+  failureCount Int                  @default(0)
+  disabledReason String?
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+
+  merchant   Merchants        @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@index([merchantId, status])
+}
+
+model WebhookDelivery {
+  id             String           @id @default(uuid())
+  publicId       String           @unique
+  endpointId     String
+  eventId        String
+  eventType      WebhookEventType
+  payload        Json
+  status         DeliveryStatus   @default(PENDING)
+  attempts       Int              @default(0)
+  nextAttemptAt  DateTime         @default(now())
+  lastStatusCode Int?
+  lastError      String?
+  deliveredAt    DateTime?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  endpoint WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+
+  @@unique([endpointId, eventId])
+  @@index([status, nextAttemptAt])
+  @@index([endpointId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Audit
+// ---------------------------------------------------------------------------
 
 model Resolution {
   id              String              @id @default(uuid())
   publicId        String              @unique
   actorId         String
+  actorType       ActorType           @default(USER)
   action          ResolutionAction
   subjectType     ResolutionSubject
   subjectPublicId String
+  metadata        Json?
   createdAt       DateTime            @default(now())
 
   actor Users @relation(fields: [actorId], references: [id])
+
+  @@index([createdAt])
+  @@index([actorId, createdAt])
+  @@index([subjectPublicId, createdAt])
 }
+
+// ---------------------------------------------------------------------------
+// Payment method detail (1:1 extension of Transactions)
+// ---------------------------------------------------------------------------
+
+model CardDetails {
+  id            String   @id @default(uuid())
+  transactionId String   @unique
+  holderName    String
+  brand         CardBrand
+  last4         String
+  expiryMonth   Int
+  expiryYear    Int
+  avsResult     String?
+  cvvResult     String?
+
+  transaction Transactions @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+}
+
+model UpiDetails {
+  id            String @id @default(uuid())
+  transactionId String @unique
+  vpa           String
+
+  transaction Transactions @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+}
+
+model NetBankingDetails {
+  id            String @id @default(uuid())
+  transactionId String @unique
+  bankCode      String
+
+  transaction Transactions @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+}
+
+model WalletDetails {
+  id            String         @id @default(uuid())
+  transactionId String         @unique
+  provider      WalletProvider
+
+  transaction Transactions @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
 
 enum Role {
   USER
@@ -191,9 +528,28 @@ enum Role {
   SUPER_ADMIN
 }
 
+enum ActorType {
+  USER
+  API_KEY
+  SYSTEM
+}
+
 enum AccountStatus {
+  PENDING_REVIEW
   ACTIVE
   SUSPENDED
+}
+
+enum KycStatus {
+  NOT_STARTED
+  SUBMITTED
+  APPROVED
+  REJECTED
+}
+
+enum KeyMode {
+  LIVE
+  TEST
 }
 
 enum PaymentStatus {
@@ -203,14 +559,36 @@ enum PaymentStatus {
   FAILED
   CANCELLED
   REFUNDED
+  PARTIALLY_REFUNDED
+  EXPIRED
 }
 
 enum TransactionStatus {
-  CREATED
   PENDING
   SUCCESS
   FAILED
   EXPIRED
+  VOIDED
+}
+
+enum RefundStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+enum PayoutStatus {
+  SCHEDULED
+  IN_TRANSIT
+  PAID
+  FAILED
+  REVERSED
+}
+
+enum DestinationStatus {
+  PENDING
+  ACTIVE
+  DISABLED
 }
 
 enum LedgerType {
@@ -226,15 +604,21 @@ enum LedgerAccount {
 enum ResolutionAction {
   SUSPEND_MERCHANT
   RESTORE_MERCHANT
+  APPROVE_MERCHANT
   SUSPEND_USER
   RESTORE_USER
   REFUND
+  CREATE_API_KEY
+  REVOKE_API_KEY
+  PAYOUT_CREATED
 }
 
 enum ResolutionSubject {
   USER
   MERCHANT
   PAYMENT
+  API_KEY
+  PAYOUT
 }
 
 enum PaymentMethod {
@@ -244,11 +628,22 @@ enum PaymentMethod {
   WALLET
 }
 
+enum SavedMethodStatus {
+  ACTIVE
+  DISABLED
+}
+
 enum CardBrand {
   VISA
   MASTERCARD
   RUPAY
   AMEX
+  DISCOVER
+  DINERS_CLUB
+  JCB
+  UNIONPAY
+  MAESTRO
+  OTHER
 }
 
 enum WalletProvider {
@@ -256,4 +651,29 @@ enum WalletProvider {
   PHONEPE
   AMAZON_PAY
   MOBIKWIK
+}
+
+enum WebhookEndpointStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum WebhookEventType {
+  PAYMENT_CREATED
+  PAYMENT_SUCCEEDED
+  PAYMENT_FAILED
+  PAYMENT_CANCELLED
+  PAYMENT_EXPIRED
+  PAYMENT_REFUNDED
+  REFUND_SUCCEEDED
+  REFUND_FAILED
+  PAYOUT_PAID
+  PAYOUT_FAILED
+}
+
+enum DeliveryStatus {
+  PENDING
+  DELIVERED
+  FAILED
+  DEAD
 }

@@ -1,0 +1,21 @@
+{
+  "name": "@payforge/node",
+  "version": "1.0.0",
+  "description": "Official server SDK for the PayForge API.",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@payforge/types": "1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  },
+  "publishConfig": { "access": "public" }
+}

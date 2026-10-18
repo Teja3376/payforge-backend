@@ -28,11 +28,14 @@ export class MethodDetailsResponseDto {
 }
 
 export class TransactionResponseDto {
-  @ApiProperty({ example: 'PF-TRX-A1B2C3D4' })
+  @ApiProperty({ example: 'PF-TRX-A1B2C3D4E5F6' })
   publicId!: string;
 
-  @ApiProperty({ example: 'PF-PAY-A1B2C3D4' })
+  @ApiProperty({ example: 'PF-PAY-A1B2C3D4E5F6' })
   paymentId!: string;
+
+  @ApiProperty({ example: 'PF-MER-A1B2C3D4E5F6' })
+  merchantPublicId!: string;
 
   @ApiProperty({ enum: PaymentMethod, example: PaymentMethod.CARD })
   method!: PaymentMethod;
@@ -40,27 +43,41 @@ export class TransactionResponseDto {
   @ApiProperty({
     type: MethodDetailsResponseDto,
     nullable: true,
-    description: 'Stored method details. Card responses include brand and last4, never the full card number or CVV.',
+    description:
+      'Stored method details. For cards this is brand and last 4 only — never the full number or CVV.',
   })
   methodDetails!: MethodDetailsResponseDto | null;
 
-  @ApiProperty({ example: 1580 })
+  @ApiProperty({ example: 950.75, description: 'Amount in settlement currency.' })
   amount!: number;
 
-  @ApiProperty({ example: 'JPY' })
+  @ApiProperty({ example: 'INR' })
   currency!: string;
 
-  @ApiProperty({ example: 0 })
+  @ApiProperty({ example: 19.02 })
   fee!: number;
 
-  @ApiProperty({ example: 0 })
+  @ApiProperty({ example: 931.73 })
   netAmount!: number;
 
-  @ApiProperty({ enum: TransactionStatus, example: TransactionStatus.PENDING })
+  @ApiProperty({ example: 200 })
+  feeBasisPoints!: number;
+
+  @ApiProperty({
+    enum: TransactionStatus,
+    example: TransactionStatus.PENDING,
+    description: 'PENDING, SUCCESS, FAILED, VOIDED, or EXPIRED.',
+  })
   status!: TransactionStatus;
 
-  @ApiProperty({ example: 'mock_6f1c0b2e-3a4d-4e5f-8a9b-0c1d2e3f4a5b' })
-  gatewayRef!: string;
+  @ApiProperty({ example: 'DO_NOT_HONOR', nullable: true })
+  failureCode!: string | null;
+
+  @ApiProperty({ example: 'The bank declined the charge.', nullable: true })
+  failureMessage!: string | null;
+
+  @ApiProperty({ example: '2026-10-18T10:31:00.000Z', nullable: true })
+  settledAt!: Date | null;
 
   @ApiProperty({ example: '2026-10-18T10:30:00.000Z' })
   createdAt!: Date;

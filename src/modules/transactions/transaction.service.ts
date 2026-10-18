@@ -1,118 +1,262 @@
+import { Inject, Injectable } from '@nestjs/common';
 import {
-  BadGatewayException,
-  BadRequestException,
-  ConflictException,
-  ForbiddenException,
-  Inject,
-  Injectable,
-  NotFoundException,
-} from '@nestjs/common';
-import { AccountStatus, PaymentMethod, PaymentStatus, Prisma, Role, TransactionStatus } from '@prisma/client';
+  AccountStatus,
+  PaymentMethod,
+  PaymentStatus,
+  Prisma,
+  Role,
+  TransactionStatus,
+  type CardBrand,
+  type WalletProvider,
+} from '@prisma/client';
 import type { RequestUser } from '../../common/auth/request-user';
+import { ApiError, ErrorCode } from '../../common/errors/api-error';
+import { assertIdempotencyKey, assertSamePayload } from '../../common/idempotency/idempotency';
+import { logger } from '../../common/logger/logger';
 import { PrismaService } from '../../database/prisma.service';
+import { paginatedQuery } from '../../common/pagination/pagination';
 import { generatePublicId } from '../../common/utils/generate-public-id';
 import { BANK_PORT, type BankPort } from '../bank/bank.port';
-import { validateCard } from './card-validation';
+import { detailsFromSavedMethod, payloadHash, sanitizeDetails, type SafeMethodDetails } from './payload-hash';
 import { CreateTransactionDto } from './dto/create-transaction.dto';
-import { payloadHash, SafeMethodDetails } from './payload-hash';
-import { presentTransaction, transactionInclude } from './transaction.presenter';
+import {
+  presentTransaction,
+  transactionInclude,
+  type TransactionWithDetails,
+} from './transaction.presenter';
 
 @Injectable()
 export class TransactionService {
+  private readonly log = logger.child({ module: 'transactions' });
+
   constructor(
     private readonly prisma: PrismaService,
     @Inject(BANK_PORT) private readonly bank: BankPort,
   ) {}
 
-  async createTransaction(user: RequestUser, dto: CreateTransactionDto) {
+  /**
+   * Attempt to collect against a payment.
+   *
+   * Ordering matters and is deliberate:
+   *  1. Validate ownership and state.
+   *  2. Resolve idempotency *before* contacting the bank.
+   *  3. Take a row lock on the payment so two concurrent attempts on the same
+   *     payment cannot both pass the "no open transaction" check.
+   *  4. Call the bank, then commit. If the commit fails, void the charge —
+   *     without that compensating call the bank holds money PayForge has no
+   *     record of, and `BankPort` has no way to reconcile it later.
+   */
+  async createTransaction(input: {
+    user: RequestUser;
+    dto: CreateTransactionDto;
+    idempotencyKey: string;
+  }) {
+    const { user, dto } = input;
+    const idempotencyKey = assertIdempotencyKey(input.idempotencyKey);
+
     if (user.status !== AccountStatus.ACTIVE) {
-      throw new ForbiddenException('Suspended users cannot pay');
+      throw ApiError.of(ErrorCode.ACCOUNT_SUSPENDED, 'Suspended users cannot pay.');
     }
 
     const payment = await this.prisma.payments.findUnique({
       where: { publicId: dto.paymentPublicId },
-      include: { merchant: true, transactions: { select: { status: true, idempotencyKey: true } } },
+      include: { merchant: true },
     });
     if (!payment || payment.userId !== user.id) {
-      throw new NotFoundException('Payment not found');
+      throw ApiError.of(ErrorCode.PAYMENT_NOT_FOUND);
     }
     if (payment.merchant.status !== AccountStatus.ACTIVE) {
-      throw new ForbiddenException('Merchant cannot receive payments');
+      throw ApiError.of(ErrorCode.MERCHANT_CANNOT_RECEIVE);
     }
-    if (payment.status === PaymentStatus.SUCCESS || payment.status === PaymentStatus.REFUNDED) {
-      throw new BadRequestException('Payment is already finalized');
+    if (payment.expiresAt.getTime() <= Date.now() || payment.status === PaymentStatus.EXPIRED) {
+      throw ApiError.of(ErrorCode.PAYMENT_EXPIRED);
+    }
+    if (
+      payment.status === PaymentStatus.SUCCESS ||
+      payment.status === PaymentStatus.REFUNDED ||
+      payment.status === PaymentStatus.PARTIALLY_REFUNDED
+    ) {
+      throw ApiError.of(ErrorCode.PAYMENT_FINALIZED);
+    }
+    if (payment.status === PaymentStatus.CANCELLED) {
+      throw ApiError.of(ErrorCode.PAYMENT_FINALIZED, 'This payment was cancelled.');
     }
 
-    const details = this.safeDetails(dto);
+    const gatewayToken = dto.gatewayToken;
+
+    const savedMethod = dto.savedPaymentMethodId
+      ? await this.prisma.savedPaymentMethod.findUnique({
+          where: { publicId: dto.savedPaymentMethodId },
+        })
+      : null;
+    if (dto.savedPaymentMethodId && (!savedMethod || savedMethod.merchantId !== payment.merchantId)) {
+      throw ApiError.of(ErrorCode.VALIDATION_FAILED, 'That saved payment method is not available.');
+    }
+    if (savedMethod && savedMethod.status !== 'ACTIVE') {
+      throw ApiError.of(
+        ErrorCode.VALIDATION_FAILED,
+        'That saved payment method has been disabled.',
+      );
+    }
+
+    // Card details can come from three places, in priority order:
+    //   1. a single-use token straight from the hosted-fields iframe
+    //   2. a card previously saved against this merchant
+    //   3. raw details in the request body (legacy, in PCI scope)
+    //
+    // (1) and (2) mean no PAN exists anywhere near this server. (3) does not.
+    const details: SafeMethodDetails = gatewayToken
+      ? tokenDetails(dto, gatewayToken)
+      : savedMethod
+        ? detailsFromSavedMethod(savedMethod)
+        : sanitizeDetails({
+            method: dto.method,
+            card: dto.card,
+            upi: dto.upi,
+            netBanking: dto.netBanking,
+            wallet: dto.wallet,
+            // Derived from the *merchant's* environment, not the payer's
+            // credential: the payer holds a session JWT and has no mode of
+            // their own, and a sandbox merchant must still be able to take
+            // test cards.
+            livemode: payment.merchant.mode === 'LIVE',
+          });
+
     const hash = payloadHash({
       paymentPublicId: dto.paymentPublicId,
       method: dto.method,
       details,
     });
 
+    // Idempotency is checked before the bank call so a retry never charges twice.
     const existing = await this.prisma.transactions.findUnique({
-      where: { userId_idempotencyKey: { userId: user.id, idempotencyKey: dto.idempotencyKey } },
+      where: { userId_idempotencyKey: { userId: user.id, idempotencyKey } },
       include: transactionInclude,
     });
     if (existing) {
-      if (existing.payloadHash !== hash) {
-        throw new ConflictException('Idempotency key was already used with a different payload');
-      }
-      return { replay: true, body: presentTransaction(existing) };
+      assertSamePayload(existing.payloadHash, hash);
+      return { replayed: true, transaction: presentTransaction(existing) };
     }
 
-    const openAttempt = payment.transactions.some(
-      (transaction) =>
-        transaction.status === TransactionStatus.PENDING || transaction.status === TransactionStatus.SUCCESS,
-    );
+    const openAttempt = await this.prisma.transactions.findFirst({
+      where: {
+        paymentId: payment.id,
+        status: { in: [TransactionStatus.PENDING, TransactionStatus.SUCCESS] },
+      },
+      select: { id: true },
+    });
     if (openAttempt) {
-      throw new ConflictException('Payment already has an open transaction');
+      throw ApiError.of(ErrorCode.PAYMENT_HAS_OPEN_TRANSACTION);
     }
 
     let gatewayRef: string;
     try {
-      const charge = await this.bank.createCharge();
+      const charge = await this.bank.createCharge({
+        amountMinor: payment.settlementAmount,
+        currency: payment.settlementCurrency,
+        idempotencyKey,
+        paymentToken: gatewayToken ?? savedMethod?.gatewayToken,
+        method: dto.method,
+      });
       gatewayRef = charge.gatewayRef;
-    } catch {
-      throw new BadGatewayException('Bank charge failed');
+    } catch (error) {
+      // The original swallowed this in a bare `catch {}`, making a bank outage
+      // undiagnosable. Log the cause and surface a coded error.
+      this.log.error(
+        { err: error, paymentId: payment.publicId },
+        'bank charge failed',
+      );
+      throw ApiError.of(
+        ErrorCode.BANK_CHARGE_FAILED,
+        'The bank declined this charge. No money has been taken.',
+        { cause: error },
+      );
     }
 
     try {
-      const created = await this.prisma.$transaction(async (tx) => {
-        const transaction = await tx.transactions.create({
-          data: {
+      const created = await this.prisma.$transaction(
+        async (tx) => {
+          // Serialise concurrent attempts on this payment. Without it, two
+          // requests with different idempotency keys both observe "no open
+          // attempt" and both charge. The partial unique index
+          // Transactions_one_open_per_payment is the backstop if this is ever
+          // bypassed; the resulting P2002 is mapped to a 409 below.
+          await tx.$queryRaw`SELECT "id" FROM "Payments" WHERE "id" = ${payment.id} FOR UPDATE`;
+
+          const stale = await tx.transactions.findFirst({
+            where: {
+              paymentId: payment.id,
+              status: { in: [TransactionStatus.PENDING, TransactionStatus.SUCCESS] },
+            },
+            select: { id: true },
+          });
+          if (stale) {
+            throw ApiError.of(ErrorCode.PAYMENT_HAS_OPEN_TRANSACTION);
+          }
+
+          const data = {
             publicId: generatePublicId('pf-trx'),
-            user: { connect: { id: user.id } },
-            payment: { connect: { id: payment.id } },
+            userId: user.id,
+            paymentId: payment.id,
             status: TransactionStatus.PENDING,
             gatewayRef,
-            idempotencyKey: dto.idempotencyKey,
+            idempotencyKey,
             payloadHash: hash,
             currency: payment.settlementCurrency,
             amount: payment.settlementAmount,
-            ...this.detailCreate(dto, details),
-          },
-          include: transactionInclude,
-        });
-        await tx.payments.update({
-          where: { id: payment.id },
-          data: { status: PaymentStatus.PENDING },
-        });
-        return transaction;
-      }, { maxWait: 10000, timeout: 20000 });
-      return { replay: false, body: presentTransaction(created) };
+            ...this.detailCreate(details),
+          } as Prisma.TransactionsUncheckedCreateInput;
+
+          const transaction = await tx.transactions.create({
+            data,
+            include: transactionInclude,
+          });
+
+          await tx.payments.update({
+            where: { id: payment.id },
+            data: { status: PaymentStatus.PENDING },
+          });
+
+          return transaction;
+        },
+        { maxWait: 10000, timeout: 20000 },
+      );
+      return { replayed: false, transaction: presentTransaction(created) };
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        // Either the idempotency key raced, or the open-transaction index
+        // fired. Both are recoverable: re-read and decide.
         const raced = await this.prisma.transactions.findUnique({
-          where: { userId_idempotencyKey: { userId: user.id, idempotencyKey: dto.idempotencyKey } },
+          where: { userId_idempotencyKey: { userId: user.id, idempotencyKey } },
           include: transactionInclude,
         });
-        if (raced && raced.payloadHash === hash) {
-          return { replay: true, body: presentTransaction(raced) };
+        if (raced) {
+          assertSamePayload(raced.payloadHash, hash);
+          return { replayed: true, transaction: presentTransaction(raced) };
         }
-        throw new ConflictException('Idempotency key was already used with a different payload');
+        throw ApiError.of(ErrorCode.PAYMENT_HAS_OPEN_TRANSACTION);
       }
+
+      // The bank already holds this charge. Release it, or the payer is charged
+      // for a transaction PayForge has no record of.
+      if (error instanceof ApiError) {
+        await this.voidOrphanedCharge(gatewayRef, error.code);
+        throw error;
+      }
+      await this.voidOrphanedCharge(gatewayRef, ErrorCode.INTERNAL_ERROR);
       throw error;
+    }
+  }
+
+  private async voidOrphanedCharge(gatewayRef: string, reason: string) {
+    try {
+      await this.bank.voidCharge({ gatewayRef, reason });
+      this.log.warn({ gatewayRef, reason }, 'voided a charge whose transaction failed to commit');
+    } catch (error) {
+      this.log.error(
+        { err: error, gatewayRef },
+        'could not void orphaned charge — reconciliation needed',
+      );
     }
   }
 
@@ -121,22 +265,34 @@ export class TransactionService {
       where: { publicId },
       include: transactionInclude,
     });
-    if (!transaction || !this.canSee(user, transaction.payment)) {
-      throw new NotFoundException('Transaction not found');
+    if (!transaction || !this.canSee(user, transaction)) {
+      throw ApiError.of(ErrorCode.TRANSACTION_NOT_FOUND);
     }
     return presentTransaction(transaction);
   }
 
-  async listTransactions(user: RequestUser) {
-    const transactions = await this.prisma.transactions.findMany({
-      where: this.scope(user),
-      include: transactionInclude,
-      orderBy: { createdAt: 'desc' },
-      take: 50,
+  async listTransactions(user: RequestUser, params: { limit: number; cursor?: string; order?: 'asc' | 'desc' }) {
+    return paginatedQuery<TransactionWithDetails, ReturnType<typeof presentTransaction>>({
+      scope: this.scope(user),
+      query: (where, take, orderBy) =>
+        this.prisma.transactions.findMany({
+          where: where as Prisma.TransactionsWhereInput,
+          include: transactionInclude,
+          orderBy: orderBy as Prisma.TransactionsOrderByWithRelationInput[],
+          take,
+        }),
+      present: presentTransaction,
+      ...params,
     });
-    return transactions.map((transaction) => presentTransaction(transaction));
   }
 
+  /**
+   * Merchant scoping.
+   *
+   * `?? 'none'` is a UUID sentinel that cannot match any row. Using
+   * `undefined` here would mean "no filter" to Prisma and would silently return
+   * every transaction on the platform — a fail-open leak.
+   */
   private scope(user: RequestUser): Prisma.TransactionsWhereInput {
     if (user.role === Role.SUPER_ADMIN) {
       return {};
@@ -147,58 +303,71 @@ export class TransactionService {
     return { userId: user.id };
   }
 
-  private canSee(user: RequestUser, payment: { userId: string; merchantId: string }) {
+  private canSee(
+    user: RequestUser,
+    transaction: { payment: { userId: string; merchantId: string } },
+  ) {
     if (user.role === Role.SUPER_ADMIN) {
       return true;
     }
     if (user.role === Role.MERCHANT) {
-      return payment.merchantId === user.merchantId;
+      return transaction.payment.merchantId === user.merchantId;
     }
-    return payment.userId === user.id;
+    return transaction.payment.userId === user.id;
   }
 
-  private safeDetails(dto: CreateTransactionDto): SafeMethodDetails {
-    switch (dto.method) {
-      case PaymentMethod.CARD: {
-        const card = validateCard(dto.card!.cardNumber, dto.card!.cvv);
-        return {
-          holderName: dto.card!.holderName,
-          brand: card.brand,
-          last4: card.last4,
-          expiryMonth: dto.card!.expiryMonth,
-          expiryYear: dto.card!.expiryYear,
-        };
-      }
-      case PaymentMethod.UPI:
-        return { vpa: dto.upi!.vpa };
-      case PaymentMethod.NET_BANKING:
-        return { bankCode: dto.netBanking!.bankCode };
-      case PaymentMethod.WALLET:
-        return { provider: dto.wallet!.provider };
-    }
-  }
-
-  private detailCreate(dto: CreateTransactionDto, details: SafeMethodDetails) {
-    switch (dto.method) {
+/**
+   * Nested create payload for the method-detail tables.
+   *
+   * Switching on `details.method` (rather than `dto.method`) lets TypeScript
+   * narrow the union, so the sanitised fields are read without casting and a
+   * mismatch between method and stored details is a compile error.
+   */
+  private detailCreate(details: SafeMethodDetails) {
+    switch (details.method) {
       case PaymentMethod.CARD:
         return {
-          method: dto.method,
+          method: PaymentMethod.CARD,
           cardDetail: {
             create: {
-              holderName: details.holderName!,
-              brand: details.brand!,
-              last4: details.last4!,
-              expiryMonth: details.expiryMonth!,
-              expiryYear: details.expiryYear!,
+              holderName: details.holderName,
+              brand: details.brand as CardBrand,
+              last4: details.last4,
+              expiryMonth: details.expiryMonth,
+              expiryYear: details.expiryYear,
             },
           },
         };
       case PaymentMethod.UPI:
-        return { method: dto.method, upiDetail: { create: { vpa: details.vpa! } } };
+        return { method: PaymentMethod.UPI, upiDetail: { create: { vpa: details.vpa } } };
       case PaymentMethod.NET_BANKING:
-        return { method: dto.method, netBankingDetail: { create: { bankCode: details.bankCode! } } };
+        return {
+          method: PaymentMethod.NET_BANKING,
+          netBankingDetail: { create: { bankCode: details.bankCode } },
+        };
       case PaymentMethod.WALLET:
-        return { method: dto.method, walletDetail: { create: { provider: details.provider! } } };
+        return {
+          method: PaymentMethod.WALLET,
+          walletDetail: { create: { provider: details.provider as WalletProvider } },
+        };
     }
   }
+}
+
+/**
+ * Card details for a charge authorised by a gateway token.
+ *
+ * The PAN was captured inside the provider's iframe and never reached this
+ * server, so there is nothing to sanitise. Only placeholder display metadata is
+ * stored; real brand and last4 arrive on the settlement callback.
+ */
+function tokenDetails(dto: CreateTransactionDto, gatewayToken: string): SafeMethodDetails {
+  return {
+    method: PaymentMethod.CARD,
+    holderName: dto.card?.holderName ?? '',
+    brand: 'OTHER',
+    last4: gatewayToken.slice(-4),
+    expiryMonth: 1,
+    expiryYear: 2000,
+  };
 }

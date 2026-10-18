@@ -1,8 +1,12 @@
-# Nestjs specific
+# Build output
 /dist
 /node_modules
 /build
 /tmp
+coverage
+
+# Package build output (the SDKs are published from here)
+/packages/*/dist
 
 # Logs
 logs
@@ -13,14 +17,17 @@ yarn-debug.log*
 yarn-error.log*
 lerna-debug.log*
 
-# dotenv environment variable files
+# Environment files.
+# `.env*` covers .env, .env.local, .env.staging, .env.production.local — the
+# variants the original list missed, which is how real credentials get
+# committed by accident. The `.env.example` template is re-included below.
 .env
-.env.development
-.env.test
-.env.production
+.env.*
+!.env.example
+
+# Local CLI credentials written by `payforge login`
+.payforge/
 
 # temp directory
 .temp
 .tmp
-
-/generated/prisma

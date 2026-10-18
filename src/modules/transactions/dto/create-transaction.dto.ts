@@ -5,12 +5,12 @@ import {
   IsEnum,
   IsInt,
   IsNotEmpty,
+  IsOptional,
   IsString,
   Matches,
   Max,
   MaxLength,
   Min,
-  MinLength,
   Validate,
   ValidateIf,
   ValidateNested,
@@ -18,6 +18,7 @@ import {
   ValidatorConstraint,
   ValidatorConstraintInterface,
 } from 'class-validator';
+import { assertNotExpired } from '../card-validation';
 
 const detailKeyByMethod = {
   [PaymentMethod.CARD]: 'card',
@@ -38,7 +39,7 @@ class MethodDetailsMatch implements ValidatorConstraintInterface {
   }
 
   defaultMessage() {
-    return 'Send only the details object that matches the payment method';
+    return 'Send only the details object that matches the payment method.';
   }
 }
 
@@ -49,12 +50,18 @@ class CardNotExpired implements ValidatorConstraintInterface {
     if (!card.expiryMonth || !card.expiryYear) {
       return false;
     }
-    const endOfExpiryMonth = new Date(card.expiryYear, card.expiryMonth, 0, 23, 59, 59);
-    return endOfExpiryMonth >= new Date();
+    try {
+      // Evaluated against UTC by `assertNotExpired`, so the result does not
+      // shift with the server's timezone.
+      assertNotExpired(card.expiryMonth, card.expiryYear);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   defaultMessage() {
-    return 'Card is expired';
+    return 'That card has expired.';
   }
 }
 
@@ -66,7 +73,11 @@ export class CardDetailsDto {
   @MaxLength(80, { message: 'Cardholder name must be 80 characters or fewer.' })
   holderName!: string;
 
-  @ApiProperty({ example: '4111111111111111', description: 'Validated, then stored only as brand and last 4 digits.' })
+  @ApiProperty({
+    example: '4111111111111111',
+    description:
+      'Legacy direct-card path. Validated then discarded — only brand and last 4 are stored. Prefer the hosted-fields flow, which keeps the PAN off PayForge servers entirely.',
+  })
   @Transform(({ value }) => (typeof value === 'string' ? value.replace(/[\s-]/g, '') : value))
   @Matches(/^\d{12,19}$/, { message: 'Enter a card number with 12 to 19 digits.' })
   cardNumber!: string;
@@ -76,14 +87,18 @@ export class CardDetailsDto {
   cvv!: string;
 
   @ApiProperty({ example: 12, minimum: 1, maximum: 12 })
+  @Type(() => Number)
   @IsInt({ message: 'Expiry month must be a number from 1 to 12.' })
   @Min(1, { message: 'Expiry month must be a number from 1 to 12.' })
   @Max(12, { message: 'Expiry month must be a number from 1 to 12.' })
   expiryMonth!: number;
 
   @ApiProperty({ example: 2030 })
+  @Type(() => Number)
   @IsInt({ message: 'Enter the card expiry year.' })
-  @Min(2026, { message: 'Expiry year must be 2026 or later.' })
+  @Min(new Date().getUTCFullYear(), {
+    message: `Expiry year must be ${new Date().getUTCFullYear()} or later.`,
+  })
   @Max(2100, { message: 'Expiry year is too far in the future.' })
   @Validate(CardNotExpired)
   expiryYear!: number;
@@ -119,7 +134,12 @@ export class CreateTransactionDto {
   @IsNotEmpty({ message: 'Enter the payment id.' })
   paymentPublicId!: string;
 
-  @ApiProperty({ enum: PaymentMethod, example: PaymentMethod.CARD })
+  @ApiProperty({
+    enum: PaymentMethod,
+    example: PaymentMethod.CARD,
+    description:
+      'How the payer is paying. When charging a saved method, use CARD together with `savedPaymentMethodId` and omit the inline `card` object.',
+  })
   @IsEnum(PaymentMethod, {
     message: 'Choose a payment method: CARD, UPI, NET_BANKING, or WALLET.',
   })
@@ -127,7 +147,7 @@ export class CreateTransactionDto {
   method!: PaymentMethod;
 
   @ApiPropertyOptional({ type: CardDetailsDto })
-  @ValidateIf((dto: CreateTransactionDto) => dto.method === PaymentMethod.CARD)
+  @ValidateIf((dto: CreateTransactionDto) => dto.method === PaymentMethod.CARD && !dto.savedPaymentMethodId)
   @ValidateNested()
   @Type(() => CardDetailsDto)
   card?: CardDetailsDto;
@@ -150,9 +170,22 @@ export class CreateTransactionDto {
   @Type(() => WalletDetailsDto)
   wallet?: WalletDetailsDto;
 
-  @ApiProperty({ example: 'order-1001', maxLength: 80 })
+  @ApiPropertyOptional({
+    example: 'PF-PM-XXXXXXXXXXXX',
+    description: 'Charge a previously saved card instead of re-sending card data.',
+  })
+  @IsOptional()
   @IsString()
-  @MinLength(1, { message: 'Enter an idempotency key.' })
-  @MaxLength(80, { message: 'Idempotency key must be 80 characters or fewer.' })
-  idempotencyKey!: string;
+  savedPaymentMethodId?: string;
+
+  @ApiPropertyOptional({
+    example: 'tok_mock_6f1c0b2e3a4d4e5f',
+    description:
+      'Single-use token returned by the hosted-fields iframe. Charge it directly to take a one-off ' +
+      'payment without first saving it. This is the PCI-safe path: the PAN never reaches PayForge.',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(255, { message: 'gatewayToken must be 255 characters or fewer.' })
+  gatewayToken?: string;
 }

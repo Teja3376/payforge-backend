@@ -6,10 +6,20 @@ export const transactionInclude = {
   upiDetail: true,
   netBankingDetail: true,
   walletDetail: true,
-  payment: { select: { publicId: true, userId: true, merchantId: true } },
+  payment: {
+    select: {
+      publicId: true,
+      userId: true,
+      merchantId: true,
+      feeBasisPoints: true,
+      merchant: { select: { publicId: true, name: true, status: true } },
+    },
+  },
 } satisfies Prisma.TransactionsInclude;
 
-export type TransactionWithDetails = Prisma.TransactionsGetPayload<{ include: typeof transactionInclude }>;
+export type TransactionWithDetails = Prisma.TransactionsGetPayload<{
+  include: typeof transactionInclude;
+}>;
 
 export function methodDetails(transaction: {
   method: PaymentMethod;
@@ -38,9 +48,13 @@ export function methodDetails(transaction: {
     case PaymentMethod.UPI:
       return transaction.upiDetail ? { vpa: transaction.upiDetail.vpa } : null;
     case PaymentMethod.NET_BANKING:
-      return transaction.netBankingDetail ? { bankCode: transaction.netBankingDetail.bankCode } : null;
+      return transaction.netBankingDetail
+        ? { bankCode: transaction.netBankingDetail.bankCode }
+        : null;
     case PaymentMethod.WALLET:
-      return transaction.walletDetail ? { provider: transaction.walletDetail.provider } : null;
+      return transaction.walletDetail
+        ? { provider: transaction.walletDetail.provider }
+        : null;
   }
 }
 
@@ -48,14 +62,18 @@ export function presentTransaction(transaction: TransactionWithDetails) {
   return {
     publicId: transaction.publicId,
     paymentId: transaction.payment.publicId,
+    merchantPublicId: transaction.payment.merchant.publicId,
     method: transaction.method,
     methodDetails: methodDetails(transaction),
     amount: toMajorNumber(transaction.amount, transaction.currency),
     currency: transaction.currency,
     fee: toMajorNumber(transaction.fee, transaction.currency),
     netAmount: toMajorNumber(transaction.netAmount, transaction.currency),
+    feeBasisPoints: transaction.payment.feeBasisPoints,
     status: transaction.status,
-    gatewayRef: transaction.gatewayRef,
+    failureCode: transaction.failureCode,
+    failureMessage: transaction.failureMessage,
+    settledAt: transaction.settledAt,
     createdAt: transaction.createdAt,
   };
 }

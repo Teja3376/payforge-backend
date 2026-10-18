@@ -1,10 +1,11 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import { AccountStatus, LedgerAccount, ResolutionAction, ResolutionSubject } from '@prisma/client';
+import { Injectable } from '@nestjs/common';
+import { AccountStatus, ActorType, LedgerAccount, LedgerType, Prisma, ResolutionAction, ResolutionSubject } from '@prisma/client';
+import { ApiError, ErrorCode } from '../../common/errors/api-error';
 import { toMajorNumber } from '../../common/money/money';
+import { paginatedQuery } from '../../common/pagination/pagination';
 import { generatePublicId } from '../../common/utils/generate-public-id';
 import { PrismaService } from '../../database/prisma.service';
 import { SettlementService } from '../webhooks/settlement.service';
-import { merchantMoney, platformFeeTotals } from './overview';
 
 @Injectable()
 export class AdminService {
@@ -13,59 +14,279 @@ export class AdminService {
     private readonly settlement: SettlementService,
   ) {}
 
+  /**
+   * Platform overview.
+   *
+   * Aggregated in the database rather than by loading whole tables into Node:
+   * the original issued three unbounded `findMany` calls and summed them in
+   * memory, which degrades linearly and is the endpoint most likely to time
+   * out once there is real volume.
+   */
   async overview() {
     const now = new Date();
-    const [merchants, payments, entries] = await Promise.all([
-      this.prisma.merchants.findMany({
-        select: { id: true, publicId: true, name: true, createdAt: true },
-      }),
-      this.prisma.payments.findMany({
-        where: { status: 'SUCCESS' },
-        select: {
-          merchantId: true,
-          settlementAmount: true,
-          settlementCurrency: true,
-          createdAt: true,
-        },
-      }),
-      this.prisma.ledgers.findMany({
+    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+
+    const [feeAllTime, feeThisMonth, merchantCount, paymentCount] = await Promise.all([
+      this.prisma.ledgers.groupBy({
+        by: ['currency', 'type'],
         where: { account: LedgerAccount.PLATFORM },
-        select: { currency: true, amount: true, type: true, createdAt: true },
+        _sum: { amount: true },
       }),
+      this.prisma.ledgers.groupBy({
+        by: ['currency', 'type'],
+        where: { account: LedgerAccount.PLATFORM, createdAt: { gte: monthStart } },
+        _sum: { amount: true },
+      }),
+      this.prisma.merchants.count({ where: { deletedAt: null } }),
+      this.prisma.payments.count({ where: { status: 'SUCCESS' } }),
     ]);
 
-    const fees = platformFeeTotals(entries, now);
-    const rows = merchantMoney(merchants, payments, now);
     return {
-      platformFeeThisMonth: this.moneyMap(fees.thisMonth),
-      platformFeeAllTime: this.moneyMap(fees.allTime),
-      merchants: rows.map((merchant) => ({
-        publicId: merchant.publicId,
-        name: merchant.name,
-        months: merchant.months,
-        byCurrency: merchant.byCurrency.map((row) => ({
-          currency: row.currency,
-          thisMonth: toMajorNumber(row.thisMonthMinor, row.currency),
-          averagePerMonth: toMajorNumber(row.averageMinor, row.currency),
-        })),
+      platformFeeAllTime: this.moneyMap(
+        new Map(
+          feeAllTime.map((row) => [
+            row.currency,
+            (row._sum.amount ?? 0n) * (row.type === LedgerType.DEBIT ? -1n : 1n),
+          ]),
+        ),
+      ),
+      platformFeeThisMonth: this.moneyMap(
+        new Map(
+          feeThisMonth.map((row) => [
+            row.currency,
+            (row._sum.amount ?? 0n) * (row.type === LedgerType.DEBIT ? -1n : 1n),
+          ]),
+        ),
+      ),
+      merchants: { total: merchantCount },
+      payments: { succeeded: paymentCount },
+      generatedAt: now.toISOString(),
+    };
+  }
+
+  /**
+   * Per-merchant revenue.
+   *
+   * Reports **net** (post-fee) figures read from the ledger, not gross
+   * `settlementAmount`. The original summed gross settlement amounts while the
+   * merchant balance was credited net, so the admin dashboard overstated every
+   * merchant's earnings by the fee rate and never reconciled with
+   * `GET /merchants/me`.
+   */
+  async merchantRevenue(publicId: string) {
+    const merchant = await this.prisma.merchants.findUnique({
+      where: { publicId },
+      select: { id: true, publicId: true, name: true, createdAt: true, status: true },
+    });
+    if (!merchant) {
+      throw ApiError.of(ErrorCode.MERCHANT_NOT_FOUND);
+    }
+
+    const now = new Date();
+    const rows = await this.prisma.ledgers.groupBy({
+      by: ['currency', 'type'],
+      where: { account: LedgerAccount.MERCHANT, merchantId: merchant.id },
+      _sum: { amount: true },
+    });
+
+    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+    const monthRows = await this.prisma.ledgers.groupBy({
+      by: ['currency', 'type'],
+      where: {
+        account: LedgerAccount.MERCHANT,
+        merchantId: merchant.id,
+        createdAt: { gte: monthStart },
+      },
+      _sum: { amount: true },
+    });
+
+    const months = Math.max(
+      1,
+      (now.getUTCFullYear() - merchant.createdAt.getUTCFullYear()) * 12 +
+        (now.getUTCMonth() - merchant.createdAt.getUTCMonth()) +
+        1,
+    );
+
+    const allTime = new Map<string, bigint>();
+    for (const row of rows) {
+      allTime.set(
+        row.currency,
+        (allTime.get(row.currency) ?? 0n) +
+          (row._sum.amount ?? 0n) * (row.type === LedgerType.DEBIT ? -1n : 1n),
+      );
+    }
+    const thisMonth = new Map<string, bigint>();
+    for (const row of monthRows) {
+      thisMonth.set(
+        row.currency,
+        (thisMonth.get(row.currency) ?? 0n) +
+          (row._sum.amount ?? 0n) * (row.type === LedgerType.DEBIT ? -1n : 1n),
+      );
+    }
+
+    const currencies = [...new Set([...allTime.keys(), ...thisMonth.keys()])].sort();
+    return {
+      publicId: merchant.publicId,
+      name: merchant.name,
+      status: merchant.status,
+      months,
+      // Net of fees, so this ties out to the merchant's own balance.
+      byCurrency: currencies.map((currency) => ({
+        currency,
+        netAllTime: toMajorNumber(allTime.get(currency) ?? 0n, currency),
+        netThisMonth: toMajorNumber(thisMonth.get(currency) ?? 0n, currency),
+        netAveragePerMonth: toMajorNumber((allTime.get(currency) ?? 0n) / BigInt(months), currency),
       })),
     };
   }
 
-  async fees() {
-    const entries = await this.prisma.ledgers.findMany({
-      where: { account: LedgerAccount.PLATFORM },
-      orderBy: { createdAt: 'desc' },
-      take: 100,
+  async fees(params: { limit: number; cursor?: string; account?: 'MERCHANT' | 'PLATFORM'; merchantId?: string }) {
+    const account = params.account ?? LedgerAccount.PLATFORM;
+    return paginatedQuery({
+      scope: { account, ...(params.merchantId ? { merchantId: params.merchantId } : {}) },
+      query: (where, take, orderBy) =>
+        this.prisma.ledgers.findMany({
+          where: where as Prisma.LedgersWhereInput,
+          include: { merchant: { select: { publicId: true, name: true } } },
+          orderBy: orderBy as Prisma.LedgersOrderByWithRelationInput[],
+          take,
+        }),
+      present: (entry) => ({
+        publicId: entry.publicId,
+        account: entry.account,
+        merchant: entry.merchant
+          ? { publicId: entry.merchant.publicId, name: entry.merchant.name }
+          : null,
+        currency: entry.currency,
+        amount: toMajorNumber(entry.amount, entry.currency),
+        type: entry.type,
+        balanceAfter:
+          entry.balanceAfter == null ? null : toMajorNumber(entry.balanceAfter, entry.currency),
+        referenceId: entry.referenceId,
+        createdAt: entry.createdAt,
+      }),
+      limit: params.limit,
+      cursor: params.cursor,
     });
-    return entries.map((entry) => ({
-      publicId: entry.publicId,
-      currency: entry.currency,
-      amount: toMajorNumber(entry.amount, entry.currency),
-      type: entry.type,
-      referenceId: entry.referenceId,
-      createdAt: entry.createdAt,
-    }));
+  }
+
+  /**
+   * Audit trail.
+   *
+   * The `Resolution` table was written on every suspend/restore/refund and had
+   * **no read endpoint** — the audit log was effectively write-only. An admin
+   * investigating a dispute had no way to see who did what.
+   */
+  async resolutions(params: { limit: number; cursor?: string; subjectPublicId?: string; action?: string }) {
+    return paginatedQuery({
+      scope: {
+        ...(params.subjectPublicId ? { subjectPublicId: params.subjectPublicId } : {}),
+        ...(params.action ? { action: params.action } : {}),
+      },
+      query: (where, take, orderBy) =>
+        this.prisma.resolution.findMany({
+          where: where as Prisma.ResolutionWhereInput,
+          include: { actor: { select: { publicId: true, email: true } } },
+          orderBy: orderBy as Prisma.ResolutionOrderByWithRelationInput[],
+          take,
+        }),
+      present: (entry) => ({
+        publicId: entry.publicId,
+        actor: entry.actor ? { publicId: entry.actor.publicId, email: entry.actor.email } : null,
+        actorType: entry.actorType,
+        action: entry.action,
+        subjectType: entry.subjectType,
+        subjectPublicId: entry.subjectPublicId,
+        metadata: entry.metadata,
+        createdAt: entry.createdAt,
+      }),
+      limit: params.limit,
+      cursor: params.cursor,
+    });
+  }
+
+  /** Payer lookup by public id — previously there was no user list at all. */
+  async listUsers(params: { limit: number; cursor?: string; status?: string }) {
+    return paginatedQuery({
+      scope: params.status ? { status: params.status } : {},
+      query: (where, take, orderBy) =>
+        this.prisma.users.findMany({
+          where: where as Prisma.UsersWhereInput,
+          select: {
+            id: true,
+            publicId: true,
+            email: true,
+            role: true,
+            status: true,
+            countryCode: true,
+            createdAt: true,
+            lastLoginAt: true,
+            merchant: { select: { publicId: true } },
+          },
+          orderBy: orderBy as Prisma.UsersOrderByWithRelationInput[],
+          take,
+        }),
+      present: (user) => ({
+        publicId: user.publicId,
+        email: user.email,
+        role: user.role,
+        status: user.status,
+        countryCode: user.countryCode,
+        merchantPublicId: user.merchant?.publicId ?? null,
+        lastLoginAt: user.lastLoginAt,
+        createdAt: user.createdAt,
+      }),
+      limit: params.limit,
+      cursor: params.cursor,
+    });
+  }
+
+  /**
+   * Paginated merchant list.
+   *
+   * Unlike the fee summary, this includes merchants with no payment history —
+   * an empty `byCurrency` row used to be indistinguishable from "zero revenue".
+   */
+  async list(params: { limit: number; cursor?: string; order?: 'asc' | 'desc'; status?: string }) {
+    return paginatedQuery({
+      scope: params.status ? { status: params.status } : {},
+      query: (where, take, orderBy) =>
+        this.prisma.merchants.findMany({
+          where: where as Prisma.MerchantsWhereInput,
+          select: {
+            id: true,
+            createdAt: true,
+            publicId: true,
+            name: true,
+            email: true,
+            status: true,
+            mode: true,
+            countryCode: true,
+            defaultFeeBasisPoints: true,
+            balances: { select: { currency: true, balance: true, pending: true } },
+          },
+          orderBy: orderBy as Prisma.MerchantsOrderByWithRelationInput[],
+          take,
+        }),
+      present: (merchant) => ({
+        publicId: merchant.publicId,
+        name: merchant.name,
+        email: merchant.email,
+        status: merchant.status,
+        mode: merchant.mode,
+        countryCode: merchant.countryCode,
+        feeBasisPoints: merchant.defaultFeeBasisPoints,
+        balances: merchant.balances.map((balance) => ({
+          currency: balance.currency,
+          amount: toMajorNumber(balance.balance, balance.currency),
+          pending: toMajorNumber(balance.pending, balance.currency),
+        })),
+        createdAt: merchant.createdAt,
+      }),
+      limit: params.limit,
+      cursor: params.cursor,
+      order: params.order,
+    });
   }
 
   suspendMerchant(actorId: string, publicId: string) {
@@ -76,6 +297,11 @@ export class AdminService {
     return this.setMerchantStatus(actorId, publicId, AccountStatus.ACTIVE, ResolutionAction.RESTORE_MERCHANT);
   }
 
+  /** Activate a merchant that self-registered into PENDING_REVIEW. */
+  approveMerchant(actorId: string, publicId: string) {
+    return this.setMerchantStatus(actorId, publicId, AccountStatus.ACTIVE, ResolutionAction.APPROVE_MERCHANT);
+  }
+
   suspendUser(actorId: string, publicId: string) {
     return this.setUserStatus(actorId, publicId, AccountStatus.SUSPENDED, ResolutionAction.SUSPEND_USER);
   }
@@ -84,13 +310,24 @@ export class AdminService {
     return this.setUserStatus(actorId, publicId, AccountStatus.ACTIVE, ResolutionAction.RESTORE_USER);
   }
 
-  async refund(actorId: string, publicId: string) {
-    const payment = await this.prisma.payments.findUnique({ where: { publicId } });
-    if (!payment) {
-      throw new NotFoundException('Payment not found');
-    }
-    await this.settlement.refund(payment.id, actorId, publicId);
-    return { publicId, status: 'REFUNDED' };
+  async refund(input: {
+    actorId: string;
+    actorType: ActorType;
+    paymentPublicId: string;
+    amountMinor?: bigint;
+    currency: string;
+    reason?: string;
+    idempotencyKey: string;
+  }) {
+    return this.settlement.refund({
+      paymentPublicId: input.paymentPublicId,
+      amountMinor: input.amountMinor,
+      currency: input.currency,
+      reason: input.reason,
+      idempotencyKey: input.idempotencyKey,
+      actorId: input.actorId,
+      actorType: input.actorType,
+    });
   }
 
   private async setMerchantStatus(
@@ -101,23 +338,30 @@ export class AdminService {
   ) {
     const merchant = await this.prisma.merchants.findUnique({ where: { publicId } });
     if (!merchant) {
-      throw new NotFoundException('Merchant not found');
+      throw ApiError.of(ErrorCode.MERCHANT_NOT_FOUND);
     }
     if (merchant.status === status) {
-      throw new ConflictException(`This merchant is already ${status === 'ACTIVE' ? 'active' : 'suspended'}.`);
+      throw ApiError.of(
+        ErrorCode.ALREADY_IN_STATE,
+        `This merchant is already ${status === 'ACTIVE' ? 'active' : status.toLowerCase()}.`,
+      );
     }
+
     await this.prisma.$transaction([
       this.prisma.merchants.update({ where: { id: merchant.id }, data: { status } }),
       this.prisma.resolution.create({
         data: {
           publicId: generatePublicId('pf-res'),
           actorId,
+          actorType: ActorType.USER,
           action,
           subjectType: ResolutionSubject.MERCHANT,
           subjectPublicId: publicId,
+          metadata: { from: merchant.status, to: status },
         },
       }),
     ]);
+
     return { publicId, status };
   }
 
@@ -129,32 +373,33 @@ export class AdminService {
   ) {
     const user = await this.prisma.users.findUnique({ where: { publicId } });
     if (!user) {
-      throw new NotFoundException('User not found');
+      throw ApiError.of(ErrorCode.USER_NOT_FOUND);
     }
     if (user.status === status) {
-      throw new ConflictException(`This user is already ${status === 'ACTIVE' ? 'active' : 'suspended'}.`);
+      throw ApiError.of(ErrorCode.ALREADY_IN_STATE, `This user is already ${status.toLowerCase()}.`);
     }
+
     await this.prisma.$transaction([
       this.prisma.users.update({ where: { id: user.id }, data: { status } }),
       this.prisma.resolution.create({
         data: {
           publicId: generatePublicId('pf-res'),
           actorId,
+          actorType: ActorType.USER,
           action,
           subjectType: ResolutionSubject.USER,
           subjectPublicId: publicId,
+          metadata: { from: user.status, to: status },
         },
       }),
     ]);
+
     return { publicId, status };
   }
 
   private moneyMap(values: Map<string, bigint>) {
     return [...values.entries()]
       .sort(([left], [right]) => left.localeCompare(right))
-      .map(([currency, amount]) => ({
-        currency,
-        amount: toMajorNumber(amount, currency),
-      }));
+      .map(([currency, amount]) => ({ currency, amount: toMajorNumber(amount, currency) }));
   }
 }

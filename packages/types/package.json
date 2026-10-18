@@ -1,0 +1,18 @@
+{
+  "name": "@payforge/types",
+  "version": "1.0.0",
+  "description": "Shared TypeScript types and enums for the PayForge API.",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  },
+  "publishConfig": { "access": "public" }
+}

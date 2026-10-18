@@ -1,3 +1,0 @@
--- AlterTable
-ALTER TABLE "Transactions" ADD COLUMN     "fee" BIGINT NOT NULL DEFAULT 0,
-ADD COLUMN     "netAmount" BIGINT NOT NULL DEFAULT 0;
