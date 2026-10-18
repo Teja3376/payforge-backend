@@ -5,7 +5,7 @@ import { ApiError, ErrorCode } from '../errors/api-error';
 import { satisfies } from '../scopes/scopes';
 import { IS_PUBLIC_KEY } from '../decorators/public.decorator';
 import { SCOPES_KEY } from '../decorators/scopes.decorator';
-import { ROLES_KEY } from '../decorators/roles.decorator';
+import { ROLES_KEY, AUTHENTICATED_KEY } from '../decorators/roles.decorator';
 import type { Role } from '@prisma/client';
 
 /**
@@ -56,6 +56,31 @@ export class AuthorizationGuard implements CanActivate {
       context.getHandler(),
       context.getClass(),
     ]);
+
+    const authenticatedOnly = this.reflector.getAllAndOverride<boolean>(AUTHENTICATED_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+
+    // Fail closed. A handler with neither @Roles nor @Scopes and no explicit
+    // @Authenticated() is a decorator omission, and every authenticated
+    // principal can reach it. That is invisible in review and expensive in
+    // production, so it is rejected rather than allowed through.
+    //
+    // The previous implementation only rejected when a *declared* role or
+    // scope was missing, which meant an endpoint with no metadata at all fell
+    // open — the exact failure this guard's docstring claimed to prevent.
+    if (
+      (!roles || roles.length === 0) &&
+      (!scopes || scopes.length === 0) &&
+      !authenticatedOnly
+    ) {
+      throw ApiError.of(
+        ErrorCode.FORBIDDEN,
+        'This endpoint is missing authorization metadata. Declare @Roles, @Scopes or @Authenticated.',
+      );
+    }
+
     if (scopes && scopes.length > 0 && user.actorType === 'API_KEY') {
       // Scope enforcement applies to API keys only.
       //

@@ -1,5 +1,15 @@
 import { Injectable } from '@nestjs/common';
-import { AccountStatus, ActorType, LedgerAccount, LedgerType, Prisma, ResolutionAction, ResolutionSubject } from '@prisma/client';
+import {
+  AccountStatus,
+  ActorType,
+  KeyMode,
+  LedgerAccount,
+  LedgerType,
+  Prisma,
+  ProviderOnboarding,
+  ResolutionAction,
+  ResolutionSubject,
+} from '@prisma/client';
 import { ApiError, ErrorCode } from '../../common/errors/api-error';
 import { toMajorNumber } from '../../common/money/money';
 import { paginatedQuery } from '../../common/pagination/pagination';
@@ -298,8 +308,375 @@ export class AdminService {
   }
 
   /** Activate a merchant that self-registered into PENDING_REVIEW. */
-  approveMerchant(actorId: string, publicId: string) {
-    return this.setMerchantStatus(actorId, publicId, AccountStatus.ACTIVE, ResolutionAction.APPROVE_MERCHANT);
+  async approveMerchant(actorId: string, publicId: string) {
+    const merchant = await this.prisma.merchants.findUnique({
+      where: { publicId },
+      include: { kyc: true, risk: true, providerAccount: true },
+    });
+    if (!merchant) {
+      throw ApiError.of(ErrorCode.MERCHANT_NOT_FOUND);
+    }
+
+    // Approving inside PayForge is not the same as being approved by a bank or
+    // payment provider. This was previously an unconditional status flip: a
+    // brand-new account with no KYC on file went ACTIVE in one call and could
+    // then take real money.
+    if (!merchant.kyc || merchant.kyc.status !== 'APPROVED') {
+      throw ApiError.of(
+        ErrorCode.VALIDATION_FAILED,
+        'KYC must be approved before this merchant can be activated.',
+        { meta: { kycStatus: merchant.kyc?.status ?? 'NOT_STARTED' } },
+      );
+    }
+    if (!merchant.risk?.sanctionsChecked || !merchant.risk?.pepChecked) {
+      throw ApiError.of(
+        ErrorCode.VALIDATION_FAILED,
+        'Sanctions and PEP screening must both be complete before activation.',
+        {
+          meta: {
+            sanctionsChecked: merchant.risk?.sanctionsChecked ?? false,
+            pepChecked: merchant.risk?.pepChecked ?? false,
+          },
+        },
+      );
+    }
+    // A merchant can be onboarded in PayForge and still be restricted at the
+    // provider. Recording the external state is what stops us taking money for
+    // someone the PSP will not actually process.
+    if (
+      merchant.providerAccount &&
+      (!merchant.providerAccount.chargesEnabled || !merchant.providerAccount.payoutsEnabled)
+    ) {
+      throw ApiError.of(
+        ErrorCode.VALIDATION_FAILED,
+        'The payment provider has not enabled charging and payouts for this merchant.',
+        {
+          meta: {
+            chargesEnabled: merchant.providerAccount.chargesEnabled,
+            payoutsEnabled: merchant.providerAccount.payoutsEnabled,
+            onboardingStatus: merchant.providerAccount.onboardingStatus,
+          },
+        },
+      );
+    }
+
+    return this.setMerchantStatus(
+      actorId,
+      publicId,
+      AccountStatus.ACTIVE,
+      ResolutionAction.APPROVE_MERCHANT,
+    );
+  }
+
+  /**
+   * Decide a KYC submission.
+   *
+   * Until this existed, KYC could be submitted but never approved or rejected:
+   * the only write to `merchantKyc` anywhere forced `SUBMITTED`, so
+   * KycStatus.APPROVED and .REJECTED were unreachable states and
+   * reviewedAt / reviewedById were never populated.
+   */
+  async reviewKyc(
+    actorId: string,
+    publicId: string,
+    dto: { decision: 'APPROVE' | 'REJECT'; reason?: string; reviewNotes?: string },
+  ) {
+    const merchant = await this.prisma.merchants.findUnique({
+      where: { publicId },
+      include: { kyc: true },
+    });
+    if (!merchant) {
+      throw ApiError.of(ErrorCode.MERCHANT_NOT_FOUND);
+    }
+    if (!merchant.kyc || merchant.kyc.status !== 'SUBMITTED') {
+      throw ApiError.of(
+        ErrorCode.ALREADY_IN_STATE,
+        'This merchant has no KYC submission awaiting review.',
+        { meta: { kycStatus: merchant.kyc?.status ?? 'NOT_STARTED' } },
+      );
+    }
+    if (dto.decision === 'REJECT' && !dto.reason) {
+      throw ApiError.of(
+        ErrorCode.VALIDATION_FAILED,
+        'A rejection reason is required and is shown to the merchant.',
+      );
+    }
+
+    const approved = dto.decision === 'APPROVE';
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.merchantKyc.update({
+        where: { merchantId: merchant.id },
+        data: {
+          status: approved ? 'APPROVED' : 'REJECTED',
+          rejectionReason: approved ? null : dto.reason,
+          reviewNotes: dto.reviewNotes ?? null,
+          reviewedAt: new Date(),
+          reviewedById: actorId,
+        },
+      });
+      await tx.resolution.create({
+        data: {
+          publicId: generatePublicId('pf-res'),
+          actorId,
+          actorType: ActorType.USER,
+          action: approved ? ResolutionAction.KYC_APPROVED : ResolutionAction.KYC_REJECTED,
+          subjectType: ResolutionSubject.MERCHANT,
+          subjectPublicId: publicId,
+          metadata: {
+            from: 'SUBMITTED',
+            to: approved ? 'APPROVED' : 'REJECTED',
+            ...(dto.reason ? { reason: dto.reason } : {}),
+          },
+        },
+      });
+    });
+
+    return this.getMerchantKyc(publicId);
+  }
+
+  /** The merchant's KYC state as recorded after a review decision. */
+  private async getMerchantKyc(publicId: string) {
+    const merchant = await this.prisma.merchants.findUnique({
+      where: { publicId },
+      include: { kyc: true, risk: true, providerAccount: true },
+    });
+    if (!merchant) {
+      throw ApiError.of(ErrorCode.MERCHANT_NOT_FOUND);
+    }
+    return {
+      publicId: merchant.publicId,
+      status: merchant.status,
+      mode: merchant.mode,
+      kyc: merchant.kyc
+        ? {
+            status: merchant.kyc.status,
+            legalName: merchant.kyc.legalName,
+            registrationNumber: merchant.kyc.registrationNumber,
+            rejectionReason: merchant.kyc.rejectionReason,
+            submittedAt: merchant.kyc.submittedAt,
+            reviewedAt: merchant.kyc.reviewedAt,
+          }
+        : null,
+      risk: merchant.risk
+        ? {
+            riskScore: merchant.risk.riskScore,
+            sanctionsChecked: merchant.risk.sanctionsChecked,
+            pepChecked: merchant.risk.pepChecked,
+            chargebackRate: merchant.risk.chargebackRate,
+          }
+        : null,
+      providerAccount: merchant.providerAccount
+        ? {
+            provider: merchant.providerAccount.provider,
+            providerAccountId: merchant.providerAccount.providerAccountId,
+            onboardingStatus: merchant.providerAccount.onboardingStatus,
+            chargesEnabled: merchant.providerAccount.chargesEnabled,
+            payoutsEnabled: merchant.providerAccount.payoutsEnabled,
+          }
+        : null,
+    };
+  }
+
+  /**
+   * Move a merchant between TEST and LIVE.
+   *
+   * `Merchants.mode` had no write site anywhere in the codebase, so it stayed
+   * TEST forever and `livemode: payment.merchant.mode === 'LIVE'` was
+   * permanently false — the test-BIN block was unreachable and no merchant
+   * could be promoted to a live environment even by hand.
+   *
+   * Promoting to LIVE additionally requires the provider to have enabled
+   * charging and payouts, since that is the system that will actually move the
+   * money.
+   */
+  async setMerchantMode(actorId: string, publicId: string, mode: KeyMode) {
+    const merchant = await this.prisma.merchants.findUnique({
+      where: { publicId },
+      include: { providerAccount: true },
+    });
+    if (!merchant) {
+      throw ApiError.of(ErrorCode.MERCHANT_NOT_FOUND);
+    }
+    if (merchant.mode === mode) {
+      throw ApiError.of(ErrorCode.ALREADY_IN_STATE, `This merchant is already in ${mode} mode.`);
+    }
+
+    if (mode === 'LIVE') {
+      if (merchant.status !== AccountStatus.ACTIVE) {
+        throw ApiError.of(
+          ErrorCode.VALIDATION_FAILED,
+          'The merchant must be active before it can go live.',
+        );
+      }
+      if (
+        !merchant.providerAccount?.chargesEnabled ||
+        !merchant.providerAccount?.payoutsEnabled
+      ) {
+        throw ApiError.of(
+          ErrorCode.VALIDATION_FAILED,
+          'The payment provider must enable charging and payouts before this merchant can go live.',
+          {
+            meta: {
+              chargesEnabled: merchant.providerAccount?.chargesEnabled ?? false,
+              payoutsEnabled: merchant.providerAccount?.payoutsEnabled ?? false,
+              onboardingStatus: merchant.providerAccount?.onboardingStatus ?? 'NOT_STARTED',
+            },
+          },
+        );
+      }
+    }
+
+    await this.prisma.$transaction([
+      this.prisma.merchants.update({ where: { id: merchant.id }, data: { mode } }),
+      this.prisma.resolution.create({
+        data: {
+          publicId: generatePublicId('pf-res'),
+          actorId,
+          actorType: ActorType.USER,
+          action: ResolutionAction.SET_MERCHANT_MODE,
+          subjectType: ResolutionSubject.MERCHANT,
+          subjectPublicId: publicId,
+          metadata: { from: merchant.mode, to: mode },
+        },
+      }),
+    ]);
+
+    return { publicId, mode };
+  }
+
+  /** Record the risk and screening state that activation is gated on. */
+  async setMerchantRisk(
+    actorId: string,
+    publicId: string,
+    input: {
+      riskScore?: number;
+      sanctionsChecked?: boolean;
+      pepChecked?: boolean;
+      chargebackRate?: number;
+    },
+  ) {
+    const merchant = await this.prisma.merchants.findUnique({ where: { publicId } });
+    if (!merchant) {
+      throw ApiError.of(ErrorCode.MERCHANT_NOT_FOUND);
+    }
+    const now = new Date();
+
+    const risk = await this.prisma.merchantRisk.upsert({
+      where: { merchantId: merchant.id },
+      create: {
+        merchantId: merchant.id,
+        riskScore: input.riskScore ?? 0,
+        sanctionsChecked: input.sanctionsChecked ?? false,
+        sanctionsCheckedAt: input.sanctionsChecked ? now : null,
+        pepChecked: input.pepChecked ?? false,
+        pepCheckedAt: input.pepChecked ? now : null,
+        chargebackRate: input.chargebackRate ?? 0,
+        chargebackUpdatedAt: input.chargebackRate != null ? now : null,
+      },
+      update: {
+        ...(input.riskScore != null ? { riskScore: input.riskScore } : {}),
+        ...(input.sanctionsChecked != null
+          ? { sanctionsChecked: input.sanctionsChecked, sanctionsCheckedAt: now }
+          : {}),
+        ...(input.pepChecked != null
+          ? { pepChecked: input.pepChecked, pepCheckedAt: now }
+          : {}),
+        ...(input.chargebackRate != null
+          ? { chargebackRate: input.chargebackRate, chargebackUpdatedAt: now }
+          : {}),
+      },
+    });
+
+    await this.prisma.resolution.create({
+      data: {
+        publicId: generatePublicId('pf-res'),
+        actorId,
+        actorType: ActorType.USER,
+        action: ResolutionAction.SET_MERCHANT_RISK,
+        subjectType: ResolutionSubject.MERCHANT,
+        subjectPublicId: publicId,
+        metadata: input as unknown as Prisma.InputJsonValue,
+      },
+    });
+
+    return {
+      publicId: merchant.publicId,
+      riskScore: risk.riskScore,
+      sanctionsChecked: risk.sanctionsChecked,
+      pepChecked: risk.pepChecked,
+      chargebackRate: risk.chargebackRate,
+    };
+  }
+
+  /**
+   * Record the payment provider's own view of a merchant.
+   *
+   * This is deliberately separate from `status`. The provider can restrict or
+   * disable a merchant at any time, and PayForge must be able to reflect that
+   * without an operator editing the database.
+   */
+  async setProviderAccount(
+    actorId: string,
+    publicId: string,
+    input: {
+      provider: string;
+      providerAccountId?: string;
+      onboardingStatus: ProviderOnboarding;
+      chargesEnabled: boolean;
+      payoutsEnabled: boolean;
+      requirementsDue?: string;
+    },
+  ) {
+    const merchant = await this.prisma.merchants.findUnique({ where: { publicId } });
+    if (!merchant) {
+      throw ApiError.of(ErrorCode.MERCHANT_NOT_FOUND);
+    }
+
+    const account = await this.prisma.merchantProviderAccount.upsert({
+      where: { merchantId: merchant.id },
+      create: {
+        publicId: generatePublicId('pf-ppa'),
+        merchantId: merchant.id,
+        provider: input.provider,
+        providerAccountId: input.providerAccountId ?? null,
+        onboardingStatus: input.onboardingStatus,
+        chargesEnabled: input.chargesEnabled,
+        payoutsEnabled: input.payoutsEnabled,
+        requirementsDue: input.requirementsDue ?? null,
+        lastSyncedAt: new Date(),
+      },
+      update: {
+        provider: input.provider,
+        ...(input.providerAccountId != null
+          ? { providerAccountId: input.providerAccountId }
+          : {}),
+        onboardingStatus: input.onboardingStatus,
+        chargesEnabled: input.chargesEnabled,
+        payoutsEnabled: input.payoutsEnabled,
+        requirementsDue: input.requirementsDue ?? null,
+        lastSyncedAt: new Date(),
+      },
+    });
+
+    await this.prisma.resolution.create({
+      data: {
+        publicId: generatePublicId('pf-res'),
+        actorId,
+        actorType: ActorType.USER,
+        action: ResolutionAction.SET_PROVIDER_ACCOUNT,
+        subjectType: ResolutionSubject.MERCHANT,
+        subjectPublicId: publicId,
+        metadata: {
+          provider: input.provider,
+          onboardingStatus: input.onboardingStatus,
+          chargesEnabled: input.chargesEnabled,
+          payoutsEnabled: input.payoutsEnabled,
+        },
+      },
+    });
+
+    return account;
   }
 
   suspendUser(actorId: string, publicId: string) {

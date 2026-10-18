@@ -1,5 +1,6 @@
 import { Body, Controller, Get, HttpCode, Param, Post, Query } from '@nestjs/common';
 import {
+  ApiBadRequestResponse,
   ApiConflictResponse,
   ApiForbiddenResponse,
   ApiHeader,
@@ -21,6 +22,12 @@ import { assertPublicId } from '../payments/payment.controller';
 import { PrismaService } from '../../database/prisma.service';
 import { AdminService } from './admin.service';
 import { RefundRequestDto } from './dto/refund-request.dto';
+import {
+  ReviewKycDto,
+  SetMerchantModeDto,
+  SetMerchantRiskDto,
+  SetProviderAccountDto,
+} from './dto/merchant-compliance.dto';
 
 @ApiTags('Admin')
 @ApiUnauthorizedResponse({ type: ApiErrorDto })
@@ -104,13 +111,95 @@ export class AdminController {
   @HttpCode(200)
   @ApiOperation({
     summary: 'Approve a pending merchant',
-    description: 'Activates a merchant that self-registered so it can start receiving payments.',
+    description:
+      'Activates a merchant so it can start receiving payments. Requires KYC to have been ' +
+      'reviewed and approved, sanctions and PEP screening to be complete, and — when a ' +
+      'provider account is on file — the payment provider to have enabled charging and ' +
+      'payouts. Approving inside PayForge does not override the provider.',
   })
   @ApiParam({ name: 'publicId', example: 'PF-MER-A1B2C3D4E5F6' })
   @ApiOkResponse({ description: 'The updated status.' })
   @ApiConflictResponse({ type: ApiErrorDto })
+  @ApiBadRequestResponse({ type: ApiErrorDto })
   approve(@CurrentUser() user: RequestUser, @Param('publicId') publicId: string) {
     return this.admin.approveMerchant(user.id, assertPublicId(publicId));
+  }
+
+  @Post('merchants/:publicId/kyc/review')
+  @HttpCode(200)
+  @ApiOperation({
+    summary: 'Approve or reject a KYC submission',
+    description:
+      'Decides a pending KYC submission. Until this existed, KYC could be submitted but ' +
+      'never approved or rejected: KycStatus.APPROVED was an unreachable state.',
+  })
+  @ApiParam({ name: 'publicId', example: 'PF-MER-A1B2C3D4E5F6' })
+  @ApiOkResponse({ description: 'The merchant KYC, risk and provider state.' })
+  @ApiBadRequestResponse({ type: ApiErrorDto })
+  @ApiConflictResponse({ type: ApiErrorDto })
+  reviewKyc(
+    @CurrentUser() user: RequestUser,
+    @Param('publicId') publicId: string,
+    @Body() dto: ReviewKycDto,
+  ) {
+    return this.admin.reviewKyc(user.id, assertPublicId(publicId), dto);
+  }
+
+  @Post('merchants/:publicId/mode')
+  @HttpCode(200)
+  @ApiOperation({
+    summary: 'Move a merchant between TEST and LIVE',
+    description:
+      'Promoting to LIVE requires the merchant to be active and the payment provider to ' +
+      'have enabled charging and payouts.',
+  })
+  @ApiParam({ name: 'publicId', example: 'PF-MER-A1B2C3D4E5F6' })
+  @ApiOkResponse({ description: 'The updated mode.' })
+  @ApiBadRequestResponse({ type: ApiErrorDto })
+  @ApiConflictResponse({ type: ApiErrorDto })
+  setMerchantMode(
+    @CurrentUser() user: RequestUser,
+    @Param('publicId') publicId: string,
+    @Body() dto: SetMerchantModeDto,
+  ) {
+    return this.admin.setMerchantMode(user.id, assertPublicId(publicId), dto.mode);
+  }
+
+  @Post('merchants/:publicId/risk')
+  @HttpCode(200)
+  @ApiOperation({
+    summary: 'Record risk and screening state',
+    description:
+      'Records the sanctions and PEP screening results that merchant activation is gated on.',
+  })
+  @ApiParam({ name: 'publicId', example: 'PF-MER-A1B2C3D4E5F6' })
+  @ApiOkResponse({ description: 'The recorded risk state.' })
+  setMerchantRisk(
+    @CurrentUser() user: RequestUser,
+    @Param('publicId') publicId: string,
+    @Body() dto: SetMerchantRiskDto,
+  ) {
+    return this.admin.setMerchantRisk(user.id, assertPublicId(publicId), dto);
+  }
+
+  @Post('merchants/:publicId/provider-account')
+  @HttpCode(200)
+  @ApiOperation({
+    summary: 'Record the payment provider onboarding and activation state',
+    description:
+      'The provider can restrict or disable a merchant independently of PayForge. Recording ' +
+      'that view is what stops the platform taking money for a merchant the PSP will not ' +
+      'process.',
+  })
+  @ApiParam({ name: 'publicId', example: 'PF-MER-A1B2C3D4E5F6' })
+  @ApiOkResponse({ description: 'The recorded provider account.' })
+  @ApiBadRequestResponse({ type: ApiErrorDto })
+  setProviderAccount(
+    @CurrentUser() user: RequestUser,
+    @Param('publicId') publicId: string,
+    @Body() dto: SetProviderAccountDto,
+  ) {
+    return this.admin.setProviderAccount(user.id, assertPublicId(publicId), dto);
   }
 
   @Post('merchants/:publicId/suspend')

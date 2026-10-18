@@ -23,6 +23,7 @@ import {
 import type { Request } from 'express';
 import { ApiErrorDto } from '../../common/swagger/api-error.dto';
 import { Authenticated } from '../../common/decorators/roles.decorator';
+import { ChangePasswordDto } from './dto/change-password.dto';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Public } from '../../common/decorators/public.decorator';
 import type { RequestUser } from '../../common/auth/request-user';
@@ -108,10 +109,31 @@ export class AuthController {
   @Post('logout')
   @HttpCode(204)
   @Authenticated()
-  @ApiOperation({ summary: 'Revoke the current session' })
+  @ApiOperation({
+    summary: 'Revoke the current session',
+    description:
+      'The session is taken from the validated `sid` claim rather than a request header. ' +
+      'Omitting it is no longer possible by accident, so this cannot be widened into ' +
+      'revoking every session by sending no header.',
+  })
   @ApiUnauthorizedResponse({ type: ApiErrorDto })
-  logout(@Headers('x-session-id') sessionId: string | undefined, @CurrentUser() user: RequestUser) {
-    return this.auth.logout(sessionId, user.id);
+  logout(@CurrentUser() user: RequestUser) {
+    return this.auth.logout(user.sessionId, user.id);
+  }
+
+  @Post('password')
+  @HttpCode(200)
+  @Authenticated()
+  @ApiOperation({
+    summary: 'Change your password',
+    description:
+      'Requires the current password. Every other session is revoked; the session making ' +
+      'the change stays active.',
+  })
+  @ApiBadRequestResponse({ type: ApiErrorDto })
+  @ApiUnauthorizedResponse({ type: ApiErrorDto })
+  changePassword(@CurrentUser() user: RequestUser, @Body() dto: ChangePasswordDto) {
+    return this.auth.changePassword(user.id, dto.currentPassword, dto.newPassword, user.sessionId);
   }
 
   @Get('sessions')

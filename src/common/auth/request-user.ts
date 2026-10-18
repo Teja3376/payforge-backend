@@ -22,6 +22,14 @@ export type RequestUser = {
   merchantId: string | null;
   /** Granted scopes. Always populated for API-key requests; empty for JWT. */
   scopes: string[];
+  /**
+   * The `sid` claim of the presented JWT, i.e. the Session row it belongs to.
+   *
+   * Present so a handler can revoke the caller's own session without trusting
+   * a client-supplied header — `POST /auth/logout` previously read
+   * `x-session-id` straight from the request.
+   */
+  sessionId?: string;
 };
 
 export function isApiKeyActor(user: RequestUser): boolean {

@@ -1,0 +1,6 @@
+-- Resolution actions for onboarding, compliance and session security.
+ALTER TYPE "ResolutionAction" ADD VALUE IF NOT EXISTS 'SET_MERCHANT_MODE';
+ALTER TYPE "ResolutionAction" ADD VALUE IF NOT EXISTS 'SET_MERCHANT_RISK';
+ALTER TYPE "ResolutionAction" ADD VALUE IF NOT EXISTS 'SET_PROVIDER_ACCOUNT';
+ALTER TYPE "ResolutionAction" ADD VALUE IF NOT EXISTS 'SESSION_REVOKED_REUSE';
+ALTER TYPE "ResolutionAction" ADD VALUE IF NOT EXISTS 'PASSWORD_CHANGED';

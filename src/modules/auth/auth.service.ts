@@ -1,7 +1,7 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
-import { Role, type Session } from '@prisma/client';
+import { ActorType, ResolutionAction, ResolutionSubject, Role, type Session } from '@prisma/client';
 import bcrypt from 'bcrypt';
 import { ApiError, ErrorCode } from '../../common/errors/api-error';
 import { generateOpaqueToken, hashApiKey } from '../../common/crypto/crypto';
@@ -174,52 +174,204 @@ export class AuthService implements OnModuleInit {
     };
   }
 
-  async refresh(refreshToken: string) {
-    const session = await this.prisma.session.findUnique({
-      where: { refreshTokenHash: hashApiKey(refreshToken) },
-      include: { user: true },
-    });
+  /**
+ * Exchange a refresh token for a new pair.
+ *
+ * Rotation is single-use and the claim-and-burn is a compare-and-set inside a
+ * transaction. Previously `issueSession()` ran *before* the revoke and neither
+ * was transactional, so two concurrent refreshes with the same token both
+ * passed the `!revokedAt` check and both minted valid session families.
+ *
+ * Reuse of an already-rotated token revokes the entire family. A stolen token
+ * replayed alongside the legitimate client would otherwise keep minting fresh
+ * sessions forever, because each rotation looked like a legitimate one.
+ */
+async refresh(refreshToken: string) {
+    const tokenHash = hashApiKey(refreshToken);
+    const now = new Date();
 
-    if (!session || session.revokedAt || session.expiresAt.getTime() <= Date.now()) {
-      throw ApiError.of(ErrorCode.TOKEN_REVOKED, 'This session is no longer valid. Please sign in again.');
-    }
-    if (session.user.deletedAt) {
-      throw ApiError.of(ErrorCode.TOKEN_REVOKED);
-    }
+    const rotated = await this.prisma.$transaction(async (tx) => {
+      const session = await tx.session.findUnique({
+        where: { refreshTokenHash: tokenHash },
+        select: {
+          id: true,
+          userId: true,
+          revokedAt: true,
+          expiresAt: true,
+          familyId: true,
+          user: { select: { deletedAt: true } },
+        },
+      });
 
-    // Rotate: the presented token is burned and replaced. Reuse of a rotated
-    // token is therefore detectable and results in full revocation.
-    const next = await this.issueSession(session.userId);
-    await this.prisma.session.update({
-      where: { id: session.id },
-      data: { revokedAt: new Date() },
+      if (!session || session.expiresAt.getTime() <= now.getTime() || session.user.deletedAt) {
+        throw ApiError.of(
+          ErrorCode.TOKEN_REVOKED,
+          'This session is no longer valid. Please sign in again.',
+        );
+      }
+
+      if (session.revokedAt) {
+        // This token was already rotated. Presenting it again means either a
+        // stolen token or a client that replayed one it had already spent.
+        // Revoke the whole family: the legitimate session and the attacker's
+        // are both compromised, and only a new sign-in should resolve it.
+        if (session.familyId) {
+          await tx.session.updateMany({
+            where: { userId: session.userId, familyId: session.familyId, revokedAt: null },
+            data: { revokedAt: now, revokedReason: 'REFRESH_TOKEN_REUSE' },
+          });
+        }
+        await tx.resolution.create({
+          data: {
+            publicId: generatePublicId('pf-res'),
+            actorId: null,
+            actorType: ActorType.SYSTEM,
+            action: ResolutionAction.SESSION_REVOKED_REUSE,
+            subjectType: ResolutionSubject.USER,
+            subjectPublicId: session.userId,
+            metadata: {
+              sessionId: session.id,
+              familyId: session.familyId ?? null,
+              reason: 'a rotated refresh token was replayed',
+            },
+          },
+        });
+
+        this.log.error(
+          { userId: session.userId, sessionId: session.id },
+          'replayed refresh token detected — revoked the entire session family',
+        );
+
+        throw ApiError.of(
+          ErrorCode.TOKEN_REVOKED,
+          'This session is no longer valid. Please sign in again.',
+        );
+      }
+
+      // Burn the presented token and mint its successor atomically, so a
+      // concurrent second refresh loses the compare-and-set instead of
+      // issuing a second valid session.
+      const burned = await tx.session.updateMany({
+        where: { id: session.id, revokedAt: null },
+        data: { revokedAt: now, revokedReason: 'ROTATED', lastUsedAt: now },
+      });
+      if (burned.count === 0) {
+        throw ApiError.of(
+          ErrorCode.TOKEN_REVOKED,
+          'This session is no longer valid. Please sign in again.',
+        );
+      }
+
+      const refresh = generateOpaqueToken(48);
+      const next = await tx.session.create({
+        data: {
+          publicId: generatePublicId('pf-ses'),
+          userId: session.userId,
+          refreshTokenHash: hashApiKey(refresh),
+          expiresAt: new Date(Date.now() + REFRESH_TOKEN_DAYS * 24 * 60 * 60 * 1000),
+          // The family is established by whichever rotation came first, so
+          // every descendant shares it and reuse detection reaches all of them.
+          familyId: session.familyId ?? session.id,
+        },
+      });
+
+      return { userId: session.userId, sessionId: next.id, refreshToken: refresh };
     });
 
     return {
       accessToken: await this.jwt.signAsync(
-        { sub: session.userId, sid: next.id },
+        { sub: rotated.userId, sid: rotated.sessionId },
         { expiresIn: ACCESS_TOKEN_TTL },
       ),
-      refreshToken: next.refreshToken,
+      refreshToken: rotated.refreshToken,
       expiresIn: 3600,
       tokenType: 'Bearer',
     };
   }
 
+  /**
+   * Revoke a session.
+   *
+   * The caller's own session is taken from the validated `sid` claim rather
+   * than a client-supplied header, which the controller previously read
+   * straight from `x-session-id`. Passing nothing revokes every session.
+   */
   async logout(sessionId: string | undefined, userId: string) {
-    // Revoke the session behind the presented refresh token, or every session
-    // for this user if they have none.
     if (sessionId) {
-      await this.prisma.session.updateMany({
-        where: { id: sessionId, userId },
-        data: { revokedAt: new Date() },
+      const revoked = await this.prisma.session.updateMany({
+        where: { id: sessionId, userId, revokedAt: null },
+        data: { revokedAt: new Date(), revokedReason: 'LOGOUT' },
       });
+      if (revoked.count > 0) {
+        return;
+      }
+      // The caller's session was already gone (expired, or revoked by a family
+      // sweep). Do not silently fall through and revoke every other device —
+      // that is what happened when the header named an unknown session.
       return;
     }
     await this.prisma.session.updateMany({
       where: { userId, revokedAt: null },
-      data: { revokedAt: new Date() },
+      data: { revokedAt: new Date(), revokedReason: 'LOGOUT_ALL' },
     });
+  }
+
+  /**
+   * Change a user's password and revoke every other session.
+   *
+   * `Users.passwordChangedAt` existed but was never read and there was no
+   * endpoint at all, so a merchant whose password leaked had no way to rotate
+   * it.
+   */
+  async changePassword(userId: string, currentPassword: string, newPassword: string, sessionId?: string) {
+    const user = await this.prisma.users.findUnique({ where: { id: userId } });
+    if (!user || user.deletedAt) {
+      throw ApiError.of(ErrorCode.UNAUTHENTICATED, 'Please sign in again.');
+    }
+
+    // Re-authenticate: a hijacked access token should not be able to lock the
+    // real owner out by changing the password.
+    const matches = await bcrypt.compare(currentPassword, user.passwordHash);
+    if (!matches) {
+      throw ApiError.of(ErrorCode.INVALID_CREDENTIALS, 'Your current password is incorrect.');
+    }
+    if (await bcrypt.compare(newPassword, user.passwordHash)) {
+      throw ApiError.of(
+        ErrorCode.VALIDATION_FAILED,
+        'Choose a password different from your current one.',
+      );
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
+    const now = new Date();
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.users.update({
+        where: { id: userId },
+        data: { passwordHash, passwordChangedAt: now },
+      });
+
+      // Keep the caller's session alive so they are not logged out of the
+      // device they changed it on; revoke everything else.
+      await tx.session.updateMany({
+        where: { userId, revokedAt: null, ...(sessionId ? { NOT: { id: sessionId } } : {}) },
+        data: { revokedAt: now, revokedReason: 'PASSWORD_CHANGED' },
+      });
+
+      await tx.resolution.create({
+        data: {
+          publicId: generatePublicId('pf-res'),
+          actorId: userId,
+          actorType: ActorType.USER,
+          action: ResolutionAction.PASSWORD_CHANGED,
+          subjectType: ResolutionSubject.USER,
+          subjectPublicId: user.publicId,
+          metadata: { otherSessionsRevoked: true },
+        },
+      });
+    });
+
+    return { changed: true };
   }
 
   async listSessions(userId: string) {

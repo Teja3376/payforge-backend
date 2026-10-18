@@ -54,9 +54,18 @@ model Session {
   lastUsedAt       DateTime?
   createdAt        DateTime  @default(now())
 
+  /// Token family. Every rotation inherits the original family, so presenting
+  /// an already-rotated token identifies the whole family and revokes it. A
+  /// stolen token replayed alongside the legitimate client would otherwise
+  /// keep minting fresh sessions indefinitely.
+  familyId         String?
+  /// Set when this session was revoked because a rotated token was replayed.
+  revokedReason    String?
+
   user Users @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, revokedAt])
+  @@index([familyId])
 }
 
 model LoginAttempt {
@@ -129,10 +138,74 @@ model Merchants {
   payoutDestinations PayoutDestination[]
   payouts       Payout[]
   kyc           MerchantKyc?
+  risk          MerchantRisk?
+  providerAccount MerchantProviderAccount?
   feeSchedule   MerchantFeeSchedule?
   paymentMethods SavedPaymentMethod[]
 
   @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Compliance
+//
+// Accepting a merchant in PayForge is not the same as being accepted by a bank
+// or payment provider. These models record the *external* party's view
+// separately, so enabling live mode requires both systems to agree rather than
+// trusting PayForge's own approval alone.
+// ---------------------------------------------------------------------------
+
+model MerchantRisk {
+  id                 String    @id @default(uuid())
+  merchantId         String    @unique
+  /// 0–100. Bands are policy, not a regulatory definition.
+  riskScore          Int       @default(0)
+  sanctionsChecked   Boolean   @default(false)
+  sanctionsCheckedAt DateTime?
+  pepChecked         Boolean   @default(false)
+  pepCheckedAt       DateTime?
+  /// Rolling chargeback rate as a fraction (0.05 = 5%).
+  chargebackRate     Float     @default(0)
+  chargebackUpdatedAt DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  merchant Merchants @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+}
+
+/// The provider's own onboarding and activation state for this merchant.
+model MerchantProviderAccount {
+  id               String              @id @default(uuid())
+  publicId         String              @unique
+  merchantId       String              @unique
+  /// Adapter identifier, e.g. 'stripe', 'razorpay'. Must match the wired
+  /// BankPort implementation so an operator can tell which system is which.
+  provider         String
+  /// The provider's account reference, e.g. Stripe's acct_…
+  providerAccountId String?
+  onboardingStatus ProviderOnboarding  @default(NOT_STARTED)
+  /// The provider will only capture funds when these are true. Recording them
+  /// is what stops PayForge taking money for a merchant the PSP has actually
+  /// restricted — the two systems routinely disagree.
+  chargesEnabled   Boolean             @default(false)
+  payoutsEnabled   Boolean             @default(false)
+  requirementsDue  String?
+  lastSyncedAt     DateTime?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  merchant Merchants @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@index([provider, onboardingStatus])
+}
+
+enum ProviderOnboarding {
+  NOT_STARTED
+  PENDING
+  /// Onboarded, but the provider is still holding funds or restricting them.
+  RESTRICTED
+  ENABLED
+  DISABLED
 }
 
 model MerchantKyc {
@@ -148,6 +221,9 @@ model MerchantKyc {
   postalCode         String?
   status             KycStatus @default(NOT_STARTED)
   rejectionReason    String?
+  /// Admin-facing review notes. Distinct from `rejectionReason`, which the
+  /// merchant sees: this is the auditor's reasoning, retained for dispute.
+  reviewNotes        String?
   submittedAt        DateTime?
   reviewedAt         DateTime?
   reviewedById       String?
@@ -640,6 +716,16 @@ enum ResolutionAction {
   KYC_REJECTED
   /// Reconciliation found a discrepancy between the journal and balances.
   RECONCILIATION_BREAK
+  /// A merchant was moved between TEST and LIVE.
+  SET_MERCHANT_MODE
+  /// Risk and sanctions/PEP screening state was recorded.
+  SET_MERCHANT_RISK
+  /// The payment provider's onboarding and activation state was recorded.
+  SET_PROVIDER_ACCOUNT
+  /// Session-family revocation triggered by a replayed refresh token.
+  SESSION_REVOKED_REUSE
+  /// A user changed their password; all other sessions were revoked.
+  PASSWORD_CHANGED
 }
 
 enum ResolutionSubject {

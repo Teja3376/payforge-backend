@@ -11,9 +11,13 @@ import { PrismaService } from '../../database/prisma.service';
 /**
  * Narrow structural type so the guard does not depend on JwtService directly.
  * Bound to a concrete implementation in `AppModule`.
+ *
+ * `sid` is the Session id. It was minted at login but the interface narrowed it
+ * away, so the guard could not consult it and revoking a session left its
+ * access token usable for the full hour.
  */
 export interface TokenVerifier {
-  verify(token: string): Promise<{ sub: string }>;
+  verify(token: string): Promise<{ sub: string; sid?: string }>;
 }
 
 /** DI token for the above. */
@@ -142,6 +146,52 @@ export class AuthGuard implements CanActivate {
       throw ApiError.of(ErrorCode.TOKEN_EXPIRED, 'Your login session is not valid. Please sign in again.');
     }
 
+    // A SUSPENDED user is locked out here rather than at each call site.
+    // Previously the guard copied status onto the principal and never checked
+    // it, so suspension only blocked the two money-write paths in
+    // payment.service and transaction.service — a suspended user could still
+    // read payments, list sessions, and call every other endpoint.
+    if (user.status === 'SUSPENDED') {
+      throw ApiError.of(
+        ErrorCode.ACCOUNT_SUSPENDED,
+        'This account is suspended. Contact support.',
+      );
+    }
+
+    // Honour the `sid` claim.
+    //
+    // The claim was minted at login but never consulted, so revoking a session
+    // left its access token usable for the full hour. `POST /auth/logout` is
+    // documented as "Revoke the current session" and did not do that.
+    //
+    // A token without a `sid` predates this check; it is accepted rather than
+    // rejected so existing sessions are not logged out by a deploy, but it
+    // also cannot be revoked until it expires.
+    if (typeof payload.sid === 'string') {
+      const session = await this.prisma.session.findUnique({
+        where: { id: payload.sid },
+        select: { revokedAt: true, expiresAt: true, userId: true },
+      });
+      if (!session || session.userId !== user.id) {
+        throw ApiError.of(
+          ErrorCode.TOKEN_REVOKED,
+          'Your login session is no longer valid. Please sign in again.',
+        );
+      }
+      if (session.revokedAt) {
+        throw ApiError.of(
+          ErrorCode.TOKEN_REVOKED,
+          'Your login session is no longer valid. Please sign in again.',
+        );
+      }
+      if (session.expiresAt.getTime() <= Date.now()) {
+        throw ApiError.of(
+          ErrorCode.TOKEN_REVOKED,
+          'Your login session has expired. Please sign in again.',
+        );
+      }
+    }
+
     return {
       actorType: ActorType.USER,
       id: user.id,
@@ -152,6 +202,7 @@ export class AuthGuard implements CanActivate {
       countryCode: user.countryCode,
       merchantId: user.merchantId,
       scopes: [],
+      sessionId: typeof payload.sid === 'string' ? payload.sid : undefined,
     };
   }
 }

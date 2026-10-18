@@ -68,6 +68,51 @@ export class TransactionService {
     if (payment.merchant.status !== AccountStatus.ACTIVE) {
       throw ApiError.of(ErrorCode.MERCHANT_CANNOT_RECEIVE);
     }
+
+    // Defence in depth on the money-moving path.
+    //
+    // `approveMerchant` gates activation on KYC, screening and provider
+    // status, but that check runs once. A merchant activated before those
+    // gates existed would never be re-examined, and the provider can restrict
+    // a merchant at any time without PayForge being told. So the charge path
+    // verifies the live-mode preconditions itself rather than trusting
+    // `status === ACTIVE` as a proxy for them.
+    if (payment.merchant.mode === 'LIVE') {
+      const [kyc, provider] = await Promise.all([
+        this.prisma.merchantKyc.findUnique({
+          where: { merchantId: payment.merchantId },
+          select: { status: true },
+        }),
+        this.prisma.merchantProviderAccount.findUnique({
+          where: { merchantId: payment.merchantId },
+          select: { chargesEnabled: true, onboardingStatus: true },
+        }),
+      ]);
+
+      if (kyc?.status !== 'APPROVED') {
+        this.log.error(
+          { merchantId: payment.merchantId, kycStatus: kyc?.status ?? 'NONE' },
+          'LIVE merchant without approved KYC — refusing the charge',
+        );
+        throw ApiError.of(
+          ErrorCode.MERCHANT_CANNOT_RECEIVE,
+          'This merchant is not currently able to receive payments. Contact support.',
+        );
+      }
+      if (provider && !provider.chargesEnabled) {
+        this.log.error(
+          {
+            merchantId: payment.merchantId,
+            onboardingStatus: provider.onboardingStatus,
+          },
+          'LIVE merchant whose payment provider is not charging — refusing the charge',
+        );
+        throw ApiError.of(
+          ErrorCode.MERCHANT_CANNOT_RECEIVE,
+          'This merchant is not currently able to receive payments. Contact support.',
+        );
+      }
+    }
     if (payment.expiresAt.getTime() <= Date.now() || payment.status === PaymentStatus.EXPIRED) {
       throw ApiError.of(ErrorCode.PAYMENT_EXPIRED);
     }
