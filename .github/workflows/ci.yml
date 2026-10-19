@@ -68,6 +68,9 @@ jobs:
             --to-schema-datamodel prisma/schema.prisma \
             --exit-code
 
+      - name: Build packages
+        run: npm run build:packages
+
       - name: Typecheck server
         run: npx tsc --noEmit
 
@@ -77,11 +80,6 @@ jobs:
           npx tsc -p packages/node/tsconfig.json --noEmit
           npx tsc -p packages/react/tsconfig.json --noEmit
           npx tsc -p packages/cli/tsconfig.json --noEmit
-
-      - name: Build packages
-        # signing.contract.spec.ts requires() the compiled SDK, so this must
-        # run before jest on a fresh checkout.
-        run: npm run build:packages
 
       - name: Lint
         run: npm run lint
