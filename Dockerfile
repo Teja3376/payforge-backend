@@ -40,7 +40,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 ENV NODE_ENV=production \
-    PORT=3000 \
+    PORT=5050 \
     NODE_OPTIONS=--enable-source-maps
 
 # Run unprivileged. The node image ships a `node` user (uid 1000).
@@ -51,12 +51,12 @@ COPY --from=build --chown=node:node /app/package.json ./package.json
 COPY --from=build --chown=node:node /app/scripts ./scripts
 
 USER node
-EXPOSE 3000
+EXPOSE 5050
 
 # Readiness reports degraded for an impaired-but-serving process, so a failing
 # probe here means the process genuinely cannot serve traffic.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:${PORT}/v1/health/ready || exit 1
+  CMD curl -fsS http://127.0.0.1:${PORT}/health/ready || exit 1
 
 # Node handles SIGTERM; main.ts enables shutdown hooks so Prisma's pool closes.
 STOPSIGNAL SIGTERM

@@ -90,12 +90,8 @@ jobs:
       - name: Build server
         run: npm run build
 
-      # Confirms the Dockerfile still produces a runnable image. A broken
-      # Dockerfile that only surfaces at deploy time is a bad trade.
-      - name: Build image
-        run: docker build -t payforge:ci .
-
   docker:
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
