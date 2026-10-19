@@ -1,4 +1,4 @@
-import { Controller, Get, Header, ServiceUnavailableException } from '@nestjs/common';
+import { Controller, Get, Header, ServiceUnavailableException, VERSION_NEUTRAL } from '@nestjs/common';
 import { ApiOkResponse, ApiOperation, ApiServiceUnavailableResponse, ApiTags } from '@nestjs/swagger';
 import { Public } from '../../common/decorators/public.decorator';
 import { DependencyHealthDto, HealthResponseDto } from './dto/health-response.dto';
@@ -6,7 +6,10 @@ import { PrismaService } from '../../database/prisma.service';
 import { MetricsService } from './metrics.service';
 
 @ApiTags('Health')
-@Controller('health')
+@Controller({
+  path: 'health',
+  version: [VERSION_NEUTRAL, '1'],
+})
 export class HealthController {
   constructor(
     private readonly prisma: PrismaService,
@@ -122,5 +125,22 @@ export class HealthController {
   @ApiOperation({ summary: 'Prometheus metrics' })
   async metricsEndpoint(): Promise<string> {
     return this.metrics.render();
+  }
+}
+
+/**
+ * Root level health and service liveness check for orchestrators / load balancers.
+ * Matches `GET /` and `GET /v1`.
+ */
+@ApiTags('Root')
+@Controller({
+  version: [VERSION_NEUTRAL, '1'],
+})
+export class RootController {
+  @Public()
+  @Get()
+  @ApiOperation({ summary: 'Root status check' })
+  root(): { status: string; service: string } {
+    return { status: 'ok', service: 'payforge' };
   }
 }

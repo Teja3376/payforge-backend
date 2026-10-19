@@ -1,7 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ScheduleModule } from '@nestjs/schedule';
 import { BankModule } from '../bank/bank.module';
-import { HealthController } from './health.controller';
+import { HealthController, RootController } from './health.controller';
 import { MetricsService } from './metrics.service';
 
 /**
@@ -15,7 +15,7 @@ import { MetricsService } from './metrics.service';
  */
 @Module({
   imports: [ScheduleModule, BankModule],
-  controllers: [HealthController],
+  controllers: [HealthController, RootController],
   providers: [MetricsService],
 })
 export class HealthModule {}
