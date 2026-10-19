@@ -13,27 +13,27 @@ datasource db {
 // ---------------------------------------------------------------------------
 
 model Users {
-  id            String        @id @default(uuid())
-  publicId      String        @unique
-  email         String        @unique
-  passwordHash  String
-  countryCode   String
-  role          Role
-  status        AccountStatus @default(ACTIVE)
-  merchantId    String?
-  failedLogins  Int           @default(0)
-  lockedUntil   DateTime?
-  lastLoginAt   DateTime?
-  passwordChangedAt DateTime  @default(now())
-  deletedAt     DateTime?
-  createdAt     DateTime      @default(now())
-  updatedAt     DateTime      @updatedAt
+  id                String        @id @default(uuid())
+  publicId          String        @unique
+  email             String        @unique
+  passwordHash      String
+  countryCode       String
+  role              Role
+  status            AccountStatus @default(ACTIVE)
+  merchantId        String?
+  failedLogins      Int           @default(0)
+  lockedUntil       DateTime?
+  lastLoginAt       DateTime?
+  passwordChangedAt DateTime      @default(now())
+  deletedAt         DateTime?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
 
-  merchant   Merchants?  @relation(fields: [merchantId], references: [id])
-  payments   Payments[]
-  transactions Transactions[]
-  resolutions Resolution[]
-  sessions   Session[]
+  merchant      Merchants?     @relation(fields: [merchantId], references: [id])
+  payments      Payments[]
+  transactions  Transactions[]
+  resolutions   Resolution[]
+  sessions      Session[]
   loginAttempts LoginAttempt[]
 
   @@index([merchantId])
@@ -58,9 +58,9 @@ model Session {
   /// an already-rotated token identifies the whole family and revokes it. A
   /// stolen token replayed alongside the legitimate client would otherwise
   /// keep minting fresh sessions indefinitely.
-  familyId         String?
+  familyId      String?
   /// Set when this session was revoked because a rotated token was replayed.
-  revokedReason    String?
+  revokedReason String?
 
   user Users @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -76,7 +76,7 @@ model LoginAttempt {
   createdAt DateTime @default(now())
 
   userId String?
-  user   Users? @relation(fields: [userId], references: [id], onDelete: SetNull)
+  user   Users?  @relation(fields: [userId], references: [id], onDelete: SetNull)
 
   @@index([email, createdAt])
   @@index([ip, createdAt])
@@ -129,19 +129,19 @@ model Merchants {
   updatedAt             DateTime      @updatedAt
   deletedAt             DateTime?
 
-  users         Users[]
-  payments      Payments[]
-  ledgers       Ledgers[]
-  balances      MerchantBalance[]
-  apiKeys       ApiKey[]
-  webhookEndpoints WebhookEndpoint[]
+  users              Users[]
+  payments           Payments[]
+  ledgers            Ledgers[]
+  balances           MerchantBalance[]
+  apiKeys            ApiKey[]
+  webhookEndpoints   WebhookEndpoint[]
   payoutDestinations PayoutDestination[]
-  payouts       Payout[]
-  kyc           MerchantKyc?
-  risk          MerchantRisk?
-  providerAccount MerchantProviderAccount?
-  feeSchedule   MerchantFeeSchedule?
-  paymentMethods SavedPaymentMethod[]
+  payouts            Payout[]
+  kyc                MerchantKyc?
+  risk               MerchantRisk?
+  providerAccount    MerchantProviderAccount?
+  feeSchedule        MerchantFeeSchedule?
+  paymentMethods     SavedPaymentMethod[]
 
   @@index([createdAt])
 }
@@ -156,43 +156,43 @@ model Merchants {
 // ---------------------------------------------------------------------------
 
 model MerchantRisk {
-  id                 String    @id @default(uuid())
-  merchantId         String    @unique
+  id                  String    @id @default(uuid())
+  merchantId          String    @unique
   /// 0–100. Bands are policy, not a regulatory definition.
-  riskScore          Int       @default(0)
-  sanctionsChecked   Boolean   @default(false)
-  sanctionsCheckedAt DateTime?
-  pepChecked         Boolean   @default(false)
-  pepCheckedAt       DateTime?
+  riskScore           Int       @default(0)
+  sanctionsChecked    Boolean   @default(false)
+  sanctionsCheckedAt  DateTime?
+  pepChecked          Boolean   @default(false)
+  pepCheckedAt        DateTime?
   /// Rolling chargeback rate as a fraction (0.05 = 5%).
-  chargebackRate     Float     @default(0)
+  chargebackRate      Float     @default(0)
   chargebackUpdatedAt DateTime?
-  createdAt          DateTime  @default(now())
-  updatedAt          DateTime  @updatedAt
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @default(now()) @updatedAt
 
   merchant Merchants @relation(fields: [merchantId], references: [id], onDelete: Cascade)
 }
 
 /// The provider's own onboarding and activation state for this merchant.
 model MerchantProviderAccount {
-  id               String              @id @default(uuid())
-  publicId         String              @unique
-  merchantId       String              @unique
+  id                String             @id @default(uuid())
+  publicId          String             @unique
+  merchantId        String             @unique
   /// Adapter identifier, e.g. 'stripe', 'razorpay'. Must match the wired
   /// BankPort implementation so an operator can tell which system is which.
-  provider         String
+  provider          String
   /// The provider's account reference, e.g. Stripe's acct_…
   providerAccountId String?
-  onboardingStatus ProviderOnboarding  @default(NOT_STARTED)
+  onboardingStatus  ProviderOnboarding @default(NOT_STARTED)
   /// The provider will only capture funds when these are true. Recording them
   /// is what stops PayForge taking money for a merchant the PSP has actually
   /// restricted — the two systems routinely disagree.
-  chargesEnabled   Boolean             @default(false)
-  payoutsEnabled   Boolean             @default(false)
-  requirementsDue  String?
-  lastSyncedAt     DateTime?
-  createdAt        DateTime            @default(now())
-  updatedAt        DateTime            @updatedAt
+  chargesEnabled    Boolean            @default(false)
+  payoutsEnabled    Boolean            @default(false)
+  requirementsDue   String?
+  lastSyncedAt      DateTime?
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @default(now()) @updatedAt
 
   merchant Merchants @relation(fields: [merchantId], references: [id], onDelete: Cascade)
 
@@ -303,10 +303,10 @@ model Payments {
   createdAt          DateTime      @default(now())
   updatedAt          DateTime      @updatedAt
 
-  user         Users          @relation(fields: [userId], references: [id])
-  merchant     Merchants      @relation(fields: [merchantId], references: [id])
-  transactions Transactions[]
-  refunds      Refund[]
+  user           Users           @relation(fields: [userId], references: [id])
+  merchant       Merchants       @relation(fields: [merchantId], references: [id])
+  transactions   Transactions[]
+  refunds        Refund[]
   clientSessions ClientSession[]
 
   @@unique([userId, idempotencyKey])
@@ -352,53 +352,54 @@ model Transactions {
 
 // Append-only money journal. Exactly two rows per movement (MERCHANT + PLATFORM).
 model Ledgers {
-  id          String         @id @default(uuid())
-  publicId    String         @unique
-  account     LedgerAccount
-  accountKey  String
-  merchantId  String?
-  currency    String
-  amount      BigInt
-  type        LedgerType
-  referenceId String
+  id           String        @id @default(uuid())
+  publicId     String        @unique
+  account      LedgerAccount
+  accountKey   String
+  merchantId   String?
+  currency     String
+  amount       BigInt
+  type         LedgerType
+  referenceId  String
   balanceAfter BigInt?
-  createdAt   DateTime       @default(now())
+  createdAt    DateTime      @default(now())
 
   merchant Merchants? @relation(fields: [merchantId], references: [id])
 
   @@unique([account, accountKey, referenceId, type])
   @@index([account, currency, createdAt])
+  @@index([account, currency, type])
   @@index([merchantId, createdAt])
   @@index([referenceId])
 }
 
 model Refund {
-  id             String       @id @default(uuid())
-  publicId       String       @unique
-  paymentId      String
-  transactionId  String
-  merchantId     String
-  amount         BigInt
-  currency       String
-  feeReversed    BigInt       @default(0)
-  netReversed    BigInt       @default(0)
-  reason         String?
+  id               String       @id @default(uuid())
+  publicId         String       @unique
+  paymentId        String
+  transactionId    String
+  merchantId       String
+  amount           BigInt
+  currency         String
+  feeReversed      BigInt       @default(0)
+  netReversed      BigInt       @default(0)
+  reason           String?
   /// PENDING is reserved before the provider is called, because a bank refund
   /// is irreversible: once the money has gone back to the cardholder there is
   /// nothing to compensate with. A row still PENDING when the sweeper runs is
   /// either in flight or was stranded by a crash, and is resolved by
   /// ReconciliationService against the provider.
-  status         RefundStatus @default(PENDING)
+  status           RefundStatus @default(PENDING)
   /// The provider's refund reference. Recorded so a stranded PENDING refund can
   /// be resolved by querying the bank rather than re-sending the money.
   gatewayRefundRef String?
-  failureReason  String?
-  idempotencyKey String
-  createdById    String
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
+  failureReason    String?
+  idempotencyKey   String
+  createdById      String
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
 
-  payment     Payments    @relation(fields: [paymentId], references: [id])
+  payment     Payments     @relation(fields: [paymentId], references: [id])
   transaction Transactions @relation(fields: [transactionId], references: [id])
 
   @@unique([merchantId, idempotencyKey])
@@ -457,14 +458,14 @@ model Payout {
 // ---------------------------------------------------------------------------
 
 model ClientSession {
-  id               String    @id @default(uuid())
-  publicId         String    @unique
-  secretHash       String    @unique
-  paymentId        String?
-  merchantId       String
-  expiresAt        DateTime
-  consumedAt       DateTime?
-  createdAt        DateTime  @default(now())
+  id         String    @id @default(uuid())
+  publicId   String    @unique
+  secretHash String    @unique
+  paymentId  String?
+  merchantId String
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
 
   payment Payments? @relation(fields: [paymentId], references: [id], onDelete: Cascade)
 
@@ -472,20 +473,20 @@ model ClientSession {
 }
 
 model SavedPaymentMethod {
-  id           String        @id @default(uuid())
-  publicId     String        @unique
+  id           String            @id @default(uuid())
+  publicId     String            @unique
   merchantId   String
   customerRef  String?
-  type         PaymentMethod @default(CARD)
-  gatewayToken String        @unique
+  type         PaymentMethod     @default(CARD)
+  gatewayToken String            @unique
   brand        CardBrand?
   last4        String?
   expiryMonth  Int?
   expiryYear   Int?
   holderName   String?
   status       SavedMethodStatus @default(ACTIVE)
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
 
   merchant Merchants @relation(fields: [merchantId], references: [id], onDelete: Cascade)
 
@@ -498,20 +499,20 @@ model SavedPaymentMethod {
 // ---------------------------------------------------------------------------
 
 model WebhookEndpoint {
-  id          String                @id @default(uuid())
-  publicId    String                @unique
-  merchantId  String
-  url         String
-  secretEnc   String
-  events      String[]
-  status      WebhookEndpointStatus @default(ACTIVE)
-  description String?
-  failureCount Int                  @default(0)
+  id             String                @id @default(uuid())
+  publicId       String                @unique
+  merchantId     String
+  url            String
+  secretEnc      String
+  events         String[]
+  status         WebhookEndpointStatus @default(ACTIVE)
+  description    String?
+  failureCount   Int                   @default(0)
   disabledReason String?
-  createdAt   DateTime              @default(now())
-  updatedAt   DateTime              @updatedAt
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
 
-  merchant   Merchants        @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  merchant   Merchants         @relation(fields: [merchantId], references: [id], onDelete: Cascade)
   deliveries WebhookDelivery[]
 
   @@index([merchantId, status])
@@ -537,6 +538,7 @@ model WebhookDelivery {
 
   @@unique([endpointId, eventId])
   @@index([status, nextAttemptAt])
+  @@index([endpointId, status, updatedAt])
   @@index([endpointId, createdAt])
 }
 
@@ -545,20 +547,20 @@ model WebhookDelivery {
 // ---------------------------------------------------------------------------
 
 model Resolution {
-  id              String              @id @default(uuid())
-  publicId        String              @unique
+  id              String            @id @default(uuid())
+  publicId        String            @unique
   /// Nullable for SYSTEM actors: a scheduled job or an inbound provider
   /// callback has no user behind it. The foreign key still applies whenever
   /// actorType is USER or API_KEY.
   actorId         String?
-  actorType       ActorType           @default(USER)
+  actorType       ActorType         @default(USER)
   action          ResolutionAction
   subjectType     ResolutionSubject
   subjectPublicId String
   metadata        Json?
-  createdAt       DateTime            @default(now())
+  createdAt       DateTime          @default(now())
 
-  actor Users? @relation(fields: [actorId], references: [id])
+  actor Users? @relation(fields: [actorId], references: [id], onDelete: Restrict)
 
   @@index([createdAt])
   @@index([actorId, createdAt])
@@ -570,8 +572,8 @@ model Resolution {
 // ---------------------------------------------------------------------------
 
 model CardDetails {
-  id            String   @id @default(uuid())
-  transactionId String   @unique
+  id            String    @id @default(uuid())
+  transactionId String    @unique
   holderName    String
   brand         CardBrand
   last4         String
