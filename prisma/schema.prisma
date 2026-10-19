@@ -538,7 +538,7 @@ model WebhookDelivery {
 
   @@unique([endpointId, eventId])
   @@index([status, nextAttemptAt])
-  @@index([endpointId, status, updatedAt])
+  @@index([endpointId, status, updatedAt], map: "WebhookDelivery_endpoint_status_idx")
   @@index([endpointId, createdAt])
 }
 
