@@ -1,7 +1,7 @@
 {
   "name": "@payforge/server",
   "version": "1.0.0",
-  "description": "PayForge \u2014 multi-currency payment orchestration platform.",
+  "description": "PayForge — multi-currency payment orchestration platform.",
   "author": "PayForge",
   "license": "UNLICENSED",
   "private": true,
@@ -50,7 +50,6 @@
     "rxjs": "^7.8.1"
   },
   "devDependencies": {
-    "@embedded-postgres/darwin-x64": "^18.4.0-beta.17",
     "@eslint/eslintrc": "^3.2.0",
     "@eslint/js": "^9.18.0",
     "@nestjs/cli": "^11.0.0",
