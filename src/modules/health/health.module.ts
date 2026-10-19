@@ -3,6 +3,7 @@ import { ScheduleModule } from '@nestjs/schedule';
 import { BankModule } from '../bank/bank.module';
 import { HealthController, RootController } from './health.controller';
 import { MetricsService } from './metrics.service';
+import { KeepAliveService } from './keep-alive.service';
 
 /**
  * Liveness, readiness and metrics.
@@ -16,6 +17,6 @@ import { MetricsService } from './metrics.service';
 @Module({
   imports: [ScheduleModule, BankModule],
   controllers: [HealthController, RootController],
-  providers: [MetricsService],
+  providers: [MetricsService, KeepAliveService],
 })
 export class HealthModule {}
