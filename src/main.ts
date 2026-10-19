@@ -166,7 +166,7 @@ async function bootstrap() {
         'Multi-currency payment orchestration. Authenticate with an API key (`x-api-key`) for integrations, or a login token (`Authorization: Bearer`) for dashboards.',
       )
       .setVersion('1.0.0')
-      .addServer(`http://localhost:${process.env.PORT ?? 3000}/v1`, 'Local')
+      .addServer(`http://localhost:5050/v1`, 'Local')
       .addBearerAuth(
         {
           type: 'http',
@@ -206,7 +206,7 @@ async function bootstrap() {
     log.info('OpenAPI docs mounted at /docs');
   }
 
-  const port = Number(process.env.PORT ?? 3000);
+  const port = 5050;
   await app.listen(port, '0.0.0.0');
   log.info(
     {
