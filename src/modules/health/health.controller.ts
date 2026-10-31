@@ -25,7 +25,7 @@ export class HealthController {
   @ApiOperation({ summary: 'Liveness check' })
   @ApiOkResponse({ type: HealthResponseDto })
   health(): HealthResponseDto {
-    return { status: 'ok' };
+    return { status: 'ok anna namaste' };
   }
 
   /**
